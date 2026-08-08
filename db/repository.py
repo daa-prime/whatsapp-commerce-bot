@@ -6,13 +6,16 @@ tenant_id and filters by it (SPEC.md Section 4/8: "no query should ever return
 or write data without this filter" -- carried over from the hospital repo's
 hospital_id scoping rule).
 
-Phase 0 (SPEC.md Section 8): this module only has the multi-tenant routing
-surface (tenants) left after stripping the hospital product's departments/
-doctors/doctor_slots/appointments/appointment_reminders logic. `products`/
-`orders`/`order_items` (SPEC.md Section 4) are Phase 5 work.
+Phase 0 (SPEC.md Section 8) stripped the hospital product's departments/
+doctors/doctor_slots/appointments/appointment_reminders logic, leaving just
+the multi-tenant routing surface (tenants). Phase 5's products/orders/
+order_items CRUD below was built ahead of schedule (nothing in core/main.py
+writes to it yet -- that's Phase 2/3 work) since the order-received handler
+and payment integration both depend on this data model existing first.
 """
 import json as json_lib
 from dataclasses import dataclass
+from decimal import Decimal
 
 from db.connection import get_connection
 
@@ -123,3 +126,264 @@ def create_tenant(
     new_id = cur.fetchone()["id"]
     conn.commit()
     return get_tenant(new_id)
+
+
+# --- Products (SPEC.md Section 4, mirrors Meta's catalog for pricing/stock lookups) ---
+
+@dataclass
+class Product:
+    id: int
+    tenant_id: int
+    name: str
+    price: Decimal
+    currency: str
+    description: str | None
+    image_url: str | None
+    sku: str | None
+    stock_quantity: int
+    category: str | None
+    is_active: bool
+
+
+def _row_to_product(row) -> Product:
+    return Product(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        name=row["name"],
+        price=row["price"],
+        currency=row["currency"],
+        description=row["description"],
+        image_url=row["image_url"],
+        sku=row["sku"],
+        stock_quantity=row["stock_quantity"],
+        category=row["category"],
+        is_active=bool(row["is_active"]),
+    )
+
+
+def get_product(tenant_id: int, product_id: int) -> Product | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM products WHERE tenant_id = ? AND id = ?",
+        (tenant_id, product_id),
+    ).fetchone()
+    return _row_to_product(row) if row else None
+
+
+def get_active_products(tenant_id: int) -> list[Product]:
+    """A tenant's currently sellable products -- scoped by tenant_id same as
+    every other query here, never returned across tenants."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM products WHERE tenant_id = ? AND is_active = 1 ORDER BY id",
+        (tenant_id,),
+    ).fetchall()
+    return [_row_to_product(r) for r in rows]
+
+
+def create_product(
+    tenant_id: int,
+    name: str,
+    price: Decimal,
+    currency: str = "INR",
+    description: str | None = None,
+    image_url: str | None = None,
+    sku: str | None = None,
+    stock_quantity: int = 0,
+    category: str | None = None,
+) -> Product:
+    """Manual product entry for now -- Phase 1's real catalog sync (SPEC.md
+    Section 3.1) will call this (or its own bulk-upsert variant) once a
+    tenant's Meta Commerce Manager catalog is linked."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO products (tenant_id, name, price, currency, description, image_url, sku, "
+        "stock_quantity, category) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        (tenant_id, name, price, currency, description, image_url, sku, stock_quantity, category),
+    )
+    new_id = cur.fetchone()["id"]
+    conn.commit()
+    return get_product(tenant_id, new_id)
+
+
+def update_product_stock(tenant_id: int, product_id: int, stock_quantity: int) -> None:
+    """Availability here is stock quantity, not a slot concept (SPEC.md
+    Section 4's note) -- decremented on order or on payment confirmation,
+    depending on the tenant's tolerance for overselling during checkout
+    (Phase 2/3 decision, not made here)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE products SET stock_quantity = ? WHERE tenant_id = ? AND id = ?",
+        (stock_quantity, tenant_id, product_id),
+    )
+    conn.commit()
+
+
+# --- Orders (SPEC.md Section 4) ---
+
+ORDER_STATUS_BROWSING = "browsing"
+ORDER_STATUS_PENDING_PAYMENT = "pending_payment"
+ORDER_STATUS_PAID = "paid"
+ORDER_STATUS_FAILED = "failed"
+ORDER_STATUS_CANCELLED = "cancelled"
+ORDER_STATUS_FULFILLED = "fulfilled"
+
+
+@dataclass
+class Order:
+    id: int
+    tenant_id: int
+    customer_phone: str
+    status: str
+    payment_link_url: str | None
+    payment_gateway_reference: str | None
+    subtotal: Decimal | None
+    total: Decimal | None
+    created_at: str
+    paid_at: str | None
+
+
+def _row_to_order(row) -> Order:
+    return Order(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        customer_phone=row["customer_phone"],
+        status=row["status"],
+        payment_link_url=row["payment_link_url"],
+        payment_gateway_reference=row["payment_gateway_reference"],
+        subtotal=row["subtotal"],
+        total=row["total"],
+        created_at=row["created_at"],
+        paid_at=row["paid_at"],
+    )
+
+
+def get_order(tenant_id: int, order_id: int) -> Order | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM orders WHERE tenant_id = ? AND id = ?",
+        (tenant_id, order_id),
+    ).fetchone()
+    return _row_to_order(row) if row else None
+
+
+def get_orders_for_phone(tenant_id: int, customer_phone: str) -> list[Order]:
+    """A customer's own order history at this tenant, most recent first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM orders WHERE tenant_id = ? AND customer_phone = ? ORDER BY created_at DESC",
+        (tenant_id, customer_phone),
+    ).fetchall()
+    return [_row_to_order(r) for r in rows]
+
+
+def create_order(
+    tenant_id: int,
+    customer_phone: str,
+    status: str = ORDER_STATUS_BROWSING,
+    subtotal: Decimal | None = None,
+    total: Decimal | None = None,
+) -> Order:
+    """Defaults to ORDER_STATUS_BROWSING -- an order row can exist before any
+    line items or pricing are known yet (SPEC.md Section 4's conversation_sessions
+    note), which is why subtotal/total are optional here."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total) "
+        "VALUES (?, ?, ?, ?, ?) RETURNING id",
+        (tenant_id, customer_phone, status, subtotal, total),
+    )
+    new_id = cur.fetchone()["id"]
+    conn.commit()
+    return get_order(tenant_id, new_id)
+
+
+def update_order_status(
+    tenant_id: int,
+    order_id: int,
+    status: str,
+    payment_link_url: str | None = None,
+    payment_gateway_reference: str | None = None,
+    paid_at: str | None = None,
+) -> None:
+    """Moves an order to a new status (e.g. ORDER_STATUS_PAID once the payment
+    gateway's webhook confirms it, Phase 3). payment_link_url/
+    payment_gateway_reference/paid_at are only overwritten when a caller
+    actually passes a value -- COALESCE keeps whatever was already stored
+    otherwise, so e.g. cancelling an order doesn't need to re-pass its
+    existing payment_link_url just to avoid blanking it out."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE orders SET status = ?, "
+        "payment_link_url = COALESCE(?, payment_link_url), "
+        "payment_gateway_reference = COALESCE(?, payment_gateway_reference), "
+        "paid_at = COALESCE(?, paid_at) "
+        "WHERE tenant_id = ? AND id = ?",
+        (status, payment_link_url, payment_gateway_reference, paid_at, tenant_id, order_id),
+    )
+    conn.commit()
+
+
+# --- Order items (SPEC.md Section 4) ---
+
+@dataclass
+class OrderItem:
+    id: int
+    tenant_id: int
+    order_id: int
+    product_id: int
+    quantity: int
+    unit_price_at_order_time: Decimal
+
+
+def _row_to_order_item(row) -> OrderItem:
+    return OrderItem(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        order_id=row["order_id"],
+        product_id=row["product_id"],
+        quantity=row["quantity"],
+        unit_price_at_order_time=row["unit_price_at_order_time"],
+    )
+
+
+def get_order_item(tenant_id: int, order_item_id: int) -> OrderItem | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM order_items WHERE tenant_id = ? AND id = ?",
+        (tenant_id, order_item_id),
+    ).fetchone()
+    return _row_to_order_item(row) if row else None
+
+
+def get_order_items(tenant_id: int, order_id: int) -> list[OrderItem]:
+    """All line items for one order, in the order they were added."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM order_items WHERE tenant_id = ? AND order_id = ? ORDER BY id",
+        (tenant_id, order_id),
+    ).fetchall()
+    return [_row_to_order_item(r) for r in rows]
+
+
+def create_order_item(
+    tenant_id: int,
+    order_id: int,
+    product_id: int,
+    quantity: int,
+    unit_price_at_order_time: Decimal,
+) -> OrderItem:
+    """unit_price_at_order_time is a snapshot of products.price at the moment
+    this line item is created -- a later price change on the product must
+    never retroactively change the total of an order that already references
+    it, so callers pass the price explicitly rather than this function
+    reading products.price itself."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO order_items (tenant_id, order_id, product_id, quantity, unit_price_at_order_time) "
+        "VALUES (?, ?, ?, ?, ?) RETURNING id",
+        (tenant_id, order_id, product_id, quantity, unit_price_at_order_time),
+    )
+    new_id = cur.fetchone()["id"]
+    conn.commit()
+    return get_order_item(tenant_id, new_id)

@@ -12,11 +12,13 @@
 --
 -- Safe to re-run: every statement is IF NOT EXISTS.
 --
--- Phase 0 (SPEC.md Section 8): this is the stripped-down schema after removing
--- the hospital product's departments/doctors/doctor_slots/appointments/
--- appointment_reminders tables entirely. `products`/`orders`/`order_items`
--- (SPEC.md Section 4) are Phase 5 work, built once the order-received webhook
--- handler (Phase 2) is in place -- not added here.
+-- Phase 0 (SPEC.md Section 8) removed the hospital product's departments/
+-- doctors/doctor_slots/appointments/appointment_reminders tables entirely,
+-- leaving just tenants + conversation_sessions. Phase 5's products/orders/
+-- order_items below were built ahead of the phases they'd normally follow
+-- (Phase 1's catalog integration, Phase 2's order-received handler, Phase 3's
+-- payment integration) since those all depend on this data model existing
+-- first -- the tables exist, but nothing in core/main.py writes to them yet.
 
 CREATE TABLE IF NOT EXISTS tenants (
     id SERIAL PRIMARY KEY,
@@ -67,4 +69,64 @@ CREATE TABLE IF NOT EXISTS conversation_sessions (
     context TEXT NOT NULL DEFAULT '{}',
     updated_at TEXT NOT NULL DEFAULT (now()::text),
     UNIQUE(customer_phone, tenant_id)
+);
+
+-- Mirrors what's synced from Meta's Commerce Manager catalog (SPEC.md Section
+-- 3.1), for local pricing/stock lookups when an order-received webhook
+-- arrives (Section 3.2) -- db/repository.py, not this table directly, is
+-- what the order handler will read from.
+CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+    name TEXT NOT NULL,
+    -- NUMERIC, not FLOAT/DOUBLE, to avoid binary floating-point rounding on
+    -- money -- same reasoning applies to orders.subtotal/total and
+    -- order_items.unit_price_at_order_time below.
+    price NUMERIC(12, 2) NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    description TEXT,
+    image_url TEXT,
+    sku TEXT,
+    stock_quantity INTEGER NOT NULL DEFAULT 0,
+    category TEXT,
+    -- INTEGER 0/1, not BOOLEAN, matching tenants.is_active's existing
+    -- convention (db/repository.py casts it with bool(row["is_active"])).
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (now()::text)
+);
+
+-- 'browsing' is the pre-order state: a row created as soon as a customer
+-- starts interacting, before any line items or pricing are known yet, which
+-- is why subtotal/total are nullable rather than NOT NULL like the hospital
+-- product's appointments.status default ('booked', assigned only once
+-- fully formed) was.
+CREATE TABLE IF NOT EXISTS orders (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+    customer_phone TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'browsing'
+        CHECK (status IN ('browsing', 'pending_payment', 'paid', 'failed', 'cancelled', 'fulfilled')),
+    payment_link_url TEXT,
+    payment_gateway_reference TEXT,
+    subtotal NUMERIC(12, 2),
+    total NUMERIC(12, 2),
+    created_at TEXT NOT NULL DEFAULT (now()::text),
+    paid_at TEXT
+);
+
+-- tenant_id is included directly here (not just reachable via order_id ->
+-- orders.tenant_id) for the same reason the hospital schema's
+-- appointment_reminders carried hospital_id alongside appointment_id: every
+-- repository query filters by tenant_id directly, without needing a join
+-- just to enforce tenant scoping.
+CREATE TABLE IF NOT EXISTS order_items (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+    order_id INTEGER NOT NULL REFERENCES orders(id),
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    quantity INTEGER NOT NULL,
+    -- Snapshot of products.price at the moment this line item was created --
+    -- a later price change on the product must never retroactively change
+    -- the total of an order that already references it.
+    unit_price_at_order_time NUMERIC(12, 2) NOT NULL
 );

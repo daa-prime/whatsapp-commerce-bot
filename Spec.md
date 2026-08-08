@@ -6,7 +6,19 @@
 
 ## 0. Progress Log (update as you go)
 
-**Status:** Fresh repo, cloned from the working hospital-booking codebase. Infrastructure (Meta webhook, multi-tenant routing, database layer, Railway/Neon deployment pattern) is proven and reusable. Domain logic (booking flow, appointments, doctors) needs to be **stripped and replaced** with commerce logic (catalog, cart, orders).
+**Status (last updated after Phase 5's data model landed):**
+
+- **Phase 0 — done.** Hospital domain logic (`booking_flow.py`, doctor/slot scheduling, appointment reminders) is stripped. Infrastructure (Meta webhook receipt, per-tenant HMAC signature validation, multi-tenant routing, Postgres connection layer, Railway/Neon deployment config) is intact and renamed (`hospital_id`/`hospitals` → `tenant_id`/`tenants`). The orphaned Google Calendar/Mercado Pago prototype (`config/`, `modules/booking/`) that predated even the hospital product is also removed.
+- **Phase 1 (catalog setup) — not started.** No Meta Commerce Manager catalog is linked to any tenant; no test catalog message has been sent or verified.
+- **Phase 2 (order-received webhook handling) — not started.** `parse_incoming_message()` has no branch for Meta's `order` message type yet; an incoming order webhook today falls into the generic "unsupported" path.
+- **Phase 3 (payment integration) — not started.** No Razorpay (or any) SDK, no payment-link generation, no gateway webhook route.
+- **Phase 4 (invoice generation) — not started.** No PDF library, no WhatsApp document-send capability yet (`WhatsAppClient` only has `send_text`/`send_list`/`send_buttons`).
+- **Phase 5 (order/inventory data model) — done, built ahead of schedule.** `products`, `orders`, and `order_items` tables exist in `db/schema.sql` with basic CRUD in `db/repository.py`, since Phases 2–4 all depend on this data model existing first. Nothing in `core/main.py` writes to these tables yet — that wiring is still Phase 2/3 work.
+- **Phase 6 (edge cases) — a placeholder only.** `reminders/scheduler.py::send_abandoned_cart_nudges()` is a no-op stub wired to `/internal/send-abandoned-cart-nudges`, earmarked for the abandoned-cart-recovery edge case specifically. The rest of Phase 6 (payment/order-confirmation races, stock hitting zero mid-checkout, duplicate order messages) is unaddressed — there's no order-handling logic yet for those races to occur in.
+- **Phase 7 (onboarding wizard: catalog/payment-gateway steps) — not started.** `admin/onboarding.py` collects tenant identity, Meta credentials, and data-connection tier only; the `meta_catalog_id`/`payment_gateway_*` columns on `tenants` exist but nothing in the form writes to them.
+- **Phase 8 (multi-tenant support beyond the pilot) — not applicable yet.** No pilot tenant has gone through Phases 1–4, so there's nothing yet to extend to a second one.
+
+`core/main.py`'s message handler is currently a placeholder that replies with the tenant's welcome message to every inbound message — it proves the webhook/signature/routing/lock chain works end-to-end, but there is no commerce functionality live yet.
 
 ---
 

@@ -24,6 +24,7 @@ What works right now: a message sent to a registered WhatsApp number is received
 |---|---|
 | Meta webhook receipt, HMAC signature validation | ✅ Working |
 | Multi-tenant routing (one deployment, many businesses) | ✅ Working |
+| Products/orders/order_items data model + CRUD | ✅ Built (built ahead of schedule; not wired to any webhook yet) |
 | Product catalog (via Meta Commerce Manager) | ❌ Not started |
 | Order-received webhook handling | ❌ Not started |
 | Payment link generation + gateway webhook (Razorpay) | ❌ Not started |
@@ -113,7 +114,7 @@ Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 pytest tests/ -v
 ```
 
-70 tests across 7 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, and the onboarding form. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
+84 tests across 8 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, and the products/orders/order_items data model's CRUD layer. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
 
 ---
 
@@ -156,7 +157,7 @@ whatsapp-commerce-bot/
 │   └── onboarding.py     # Tenant onboarding form (/admin/onboard-tenant)
 ├── db/
 │   ├── connection.py      # Postgres connection layer
-│   ├── schema.sql         # Data model (tenants; commerce tables land in Phase 5)
+│   ├── schema.sql         # Data model (tenants, products, orders, order_items)
 │   ├── repository.py      # The only module that writes raw SQL
 │   ├── init_db.py         # Schema init + seed on startup
 │   └── seed.py            # Seed data (default tenant, test tenant)
