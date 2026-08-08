@@ -1,71 +1,69 @@
 # Architecture Decisions
 
-Technical decisions made during development, with rationale. Written for hiring managers and developers who want to understand _why_, not just _what_.
+Technical decisions made during development, with rationale.
 
-## Claude over GPT for conversation
+## Fork the hospital-booking infra rather than start from scratch
 
-**Decision:** Use Anthropic Claude (Haiku) as the conversational AI.
+**Decision:** This repo was seeded from a working WhatsApp hospital-booking product (webhook receipt, multi-tenant routing, Postgres connection layer, Railway/Neon deployment) instead of building a new WhatsApp bot from zero.
 
-**Why:** Claude follows system prompt instructions more reliably than GPT for structured output extraction. The bot needs to generate natural conversational responses AND emit structured JSON intents — Claude does this consistently without breaking the conversation flow. Haiku specifically because it's fast enough for real-time WhatsApp conversations (~300ms) and cheap enough for production use ($0.25/1M input tokens).
+**Why:** The plumbing a WhatsApp-native business bot needs — verified webhook signatures, per-tenant credential routing, a Redis-or-in-memory session/lock layer, a Postgres connection adapter — is identical regardless of whether the domain is appointments or orders. That infrastructure was already proven in production; only the domain logic (booking flow, doctor/slot scheduling) was hospital-specific and needed to be replaced.
 
-**Trade-off:** Vendor lock-in to Anthropic. Mitigated by keeping the AI module (`core/ai.py`) isolated — swapping to another provider requires changing one file.
+**How:** Phase 0 (see [Spec.md](Spec.md) Section 8) started with an explicit audit — every file/function classified as either domain logic (deleted) or reusable infrastructure (kept, renamed `hospital_id`/`hospitals` → `tenant_id`/`tenants`) — before anything was deleted, so the reuse boundary was a deliberate decision, not a guess.
 
-## Intent extraction over function calling
+**Trade-off:** Some naming/shape still echoes the hospital domain (e.g. the connector-interface "data tier" concept in `tenants`, mirrored from the hospital repo's Tier 1/2/3 pattern) rather than being designed fresh for commerce. Acceptable — the pattern itself (self-serve DB vs. connect-your-own-API vs. manually-assisted direct connection) is genuinely domain-agnostic.
 
-**Decision:** Claude appends a JSON intent block to its natural language response, which the system extracts with regex. We don't use Claude's native tool_use/function calling.
+## Strip and stub before building — infra first, domain logic later
 
-**Why:** Function calling forces a choice: either the model calls a tool OR responds conversationally. In a booking flow, we need both — the user sees a natural confirmation message while the system gets structured data to create the calendar event. By having Claude embed the intent in its response, we get the best of both worlds.
+**Decision:** Phase 0 replaced the hospital-specific message handler with a placeholder that just echoes the tenant's welcome message, rather than building any commerce logic in the same pass.
 
-**Trade-off:** Regex-based extraction is more fragile than native function calling. Mitigated by using a strict pattern and handling parse failures gracefully (the message still reaches the user, the intent is just lost).
+**Why:** Deleting `core/booking_flow.py` left nothing to dispatch incoming messages to. Building a real order-handling flow at the same time as the strip-and-rename pass would have mixed two different kinds of risk — "did the rename break routing" and "is the new commerce logic correct" — into one change. Keeping the placeholder trivial (send the welcome message, prove the webhook/signature/routing/lock chain still works end-to-end) let Phase 0 be verified in isolation.
 
-## FastAPI over LangChain/LangGraph
+**Trade-off:** The app currently can't do anything commerce-related. That's intentional, not an oversight — see [Spec.md](Spec.md) Section 0 for exactly what's built vs. planned.
 
-**Decision:** Plain FastAPI with direct Anthropic SDK calls. No LangChain, no LangGraph, no agent frameworks.
+## Multi-tenant from the first table, not retrofitted later
 
-**Why:** The bot has a clear request-response flow: message comes in → AI responds → intent is extracted → action is taken. There are no complex chains, no multi-step reasoning, no tool selection. Adding LangChain would add 15+ dependencies and abstractions for a problem that's solved by ~50 lines of direct API calls.
+**Decision:** Every table carries a `tenant_id` column and every repository query filters by it explicitly, even now that (per Section 6 of the last status review) there's no confirmed live pilot tenant yet.
 
-**Trade-off:** If the bot grows into a multi-agent system with complex routing, we'd need to add orchestration. For a single-purpose booking agent, direct API calls are simpler, faster, and easier to debug.
+**Why:** Carried over directly from the hospital repo's `hospital_id` convention. Retrofitting a tenant-scoping column onto live data later is much harder than including it from row one — cheap now, expensive after real customer data exists.
 
-## Dual Redis/in-memory backend
+## Postgres via a thin sqlite3-shaped adapter, not raw psycopg2 everywhere
 
-**Decision:** Every stateful component (conversation history, message locks, pending payments, slot locks) has both a Redis implementation and an in-memory fallback.
+**Decision:** `db/connection.py`'s `_PGConnection` wraps psycopg2 to expose `conn.execute(sql, params).fetchone()/.fetchall()` chaining and dict-like row access, and rewrites `?` placeholders to psycopg2's `%s` style.
 
-**Why:** Redis is the right choice for production (persistence, TTL, shared state across workers). But requiring Redis for local development adds friction. The dual backend lets developers run `uvicorn core.main:app --reload` with zero setup — no Docker, no Redis, no infrastructure.
+**Why:** Inherited from the hospital repo's own migration off SQLite — `db/repository.py`'s call sites were already written against `sqlite3.Connection`'s chaining convenience, so this adapter let that migration (and everything built on top of it since) avoid touching every call site individually. Autocommit is on so a caught `IntegrityError` (e.g. a duplicate `whatsapp_phone_number_id` at onboarding) doesn't poison the rest of the connection's transaction state, matching how SQLite behaved.
 
-**How:** `history.py` pings Redis on startup. If available, uses `RedisHistory`. If not, falls back to `InMemoryHistory`. Same interface, transparent to the rest of the codebase.
+**Trade-off:** An extra indirection layer over "just use psycopg2 directly." Worth it for how much of the existing repository code it let carry over unchanged.
 
-## YAML config over database
+## Sync psycopg2 over asyncpg despite an async FastAPI app
 
-**Decision:** Client configuration lives in `config.yaml` and `knowledge/client.txt`, not in a database.
+**Decision:** `db/repository.py` is plain synchronous code, called directly from async FastAPI handlers (blocking the event loop on every DB call).
 
-**Why:** This bot serves one business at a time. A database adds complexity (migrations, connection pooling, ORM) for a problem that's solved by a YAML file. New clients are onboarded by editing two text files — no admin panel needed, no database setup.
+**Why:** Inherited as-is from the hospital repo. Switching to asyncpg would mean async-ifying every repository function and every caller — a much bigger change than reusing the existing data-access layer. Traffic volume for a single-pilot-tenant storefront doesn't yet justify that rewrite.
 
-**Trade-off:** Multi-tenant support would require a database. If this evolves into a SaaS platform serving multiple businesses, the config system would need to be rewritten. For now, YAML is the right level of complexity.
+**Trade-off:** Won't scale gracefully to high concurrent load without revisiting. Reasonable to defer until there's a real multi-tenant traffic pattern to design against.
 
-## Dynamic system prompt with pre-calculated dates
+## Dual Redis/in-memory backend for session state, history, and message locks
 
-**Decision:** The system prompt is rebuilt on every request, injecting today's date and the next 5 available booking dates.
+**Decision:** Every stateful component (conversation session store, message history, per-`(tenant, phone)` processing lock) has both a Redis implementation and an in-memory fallback, chosen automatically based on whether `REDIS_URL` is set and reachable.
 
-**Why:** LLMs are bad at date math. If you tell Claude "booking days are Monday, Wednesday, Friday" and today is Thursday, it might suggest Saturday. By pre-calculating the next available dates and injecting them into the prompt, we eliminate date hallucination entirely.
+**Why:** Redis is the right choice in production (persistence, TTL, shared state across worker processes). Requiring it for local development adds friction. The dual backend lets `uvicorn core.main:app --reload` run with zero extra infrastructure.
 
-**Trade-off:** The system prompt is slightly longer (~200 tokens more). Worth it for 100% date accuracy.
+## Per-tenant HMAC signature validation, not one global secret
 
-## Per-phone message locking
+**Decision:** Each tenant's `app_secret_ref` is looked up and checked independently; a payload signed with tenant A's secret is never valid for tenant B's `phone_number_id`, even though both tenants share one webhook endpoint.
 
-**Decision:** Each phone number has a lock (Redis or in-memory) that prevents concurrent message processing.
+**Why:** Webhooks are public endpoints. With one deployment serving many businesses, a single shared secret would mean any one tenant's leaked/misconfigured secret compromises every other tenant sharing the deployment. Constant-time comparison (`hmac.compare_digest`) additionally prevents timing attacks. A tenant with no secret configured yet (mid-onboarding) fails closed rather than crashing or accidentally validating.
 
-**Why:** WhatsApp can deliver multiple messages from the same user in rapid succession (e.g., user sends "book" and "tomorrow" within 1 second). Without locking, both messages would be processed simultaneously, potentially creating duplicate bookings or corrupted conversation state.
+## Per-`(tenant, phone)` message locking
 
-**Trade-off:** Messages from the same user are processed sequentially, adding ~50ms latency for burst messages. Acceptable for a chat interface.
+**Decision:** Each `(tenant_id, phone)` pair has a short-TTL lock (Redis or in-memory) that prevents concurrent processing of messages from the same customer at the same business.
 
-## Mercado Pago as optional module
+**Why:** WhatsApp can deliver multiple messages from the same customer in rapid succession. Without locking, near-simultaneous messages could be processed out of order or duplicate side effects (once order/payment logic exists, this becomes the difference between one order and two).
 
-**Decision:** Payment integration is a module that can be enabled/disabled via config.
+**Trade-off:** Messages from the same customer are processed sequentially, adding latency for burst messages. Acceptable for a chat interface; scoped by tenant so one business's traffic can never lock out another's.
 
-**Why:** Not every business needs online payments with their booking system. Many professionals (especially in Latin America) prefer to collect payment in person. Making it optional keeps the core booking flow simple while allowing payment when needed.
+## Asia/Kolkata as the default tenant timezone
 
-## HMAC signature validation on all webhooks
+**Decision:** `tenants.timezone` defaults to `Asia/Kolkata` if not set explicitly at onboarding.
 
-**Decision:** Both the WhatsApp webhook and the Mercado Pago webhook validate incoming requests using HMAC-SHA256 signatures with `hmac.compare_digest` (constant-time comparison).
-
-**Why:** Webhooks are public endpoints. Without signature validation, anyone could trigger fake bookings or fake payment confirmations. Constant-time comparison prevents timing attacks.
+**Why:** Razorpay — the planned default payment gateway (Spec.md Section 3.3) — targets Indian businesses. A sensible default avoids forcing every onboarding to specify a timezone just to get correct order/invoice timestamp display later.

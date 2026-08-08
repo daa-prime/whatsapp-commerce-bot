@@ -1,90 +1,61 @@
-<h1 align="center">WhatsApp AI Receptionist</h1>
+<h1 align="center">WhatsApp Commerce Storefront</h1>
 
-**Your clients are messaging you on WhatsApp anyway. This bot answers them.**
+**A WhatsApp-native storefront for e-commerce businesses with low website footfall.**
 
-Service businesses -- dentists, nutritionists, physiotherapists, salons -- lose bookings because nobody picks up the phone at 11pm. Clients message on WhatsApp, get no reply, and book elsewhere. The AI receptionist handles the conversation, checks real-time availability, and books directly into Google Calendar. No app to install, no portal to learn. Just WhatsApp.
+Customers message the business's WhatsApp number, browse a product catalog natively inside WhatsApp, add items to a cart, check out via a payment link, and receive an invoice — all without leaving WhatsApp except to complete payment. No custom UI for things Meta's Commerce Platform already provides.
 
-![Python](https://img.shields.io/badge/Python-3.12+-blue)
-![Tests](https://github.com/martin-minghetti/whatsapp-ai-receptionist/actions/workflows/tests.yml/badge.svg)
+![Python](https://img.shields.io/badge/Python-3.13-blue)
+![Tests](https://github.com/daa-prime/whatsapp-commerce-bot/actions/workflows/tests.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
 
-## What it does
+## Status
 
-| Capability | How |
+**Early — infrastructure only, no commerce features live yet.** This repo was forked from a working WhatsApp hospital-booking product to reuse its multi-tenant webhook infrastructure. Phase 0 (stripping the hospital domain logic, keeping the infra) is done. Catalog integration, order handling, payment, and invoicing are not built yet. See [Spec.md](Spec.md) Section 0 for the current build-phase status in detail, and Section 5 for the full phase plan.
+
+What works right now: a message sent to a registered WhatsApp number is received, routed to the correct tenant, signature-verified, and replied to with that tenant's welcome message. That's it — there's no catalog, cart, order, or payment flow yet.
+
+---
+
+## What it will do (per [Spec.md](Spec.md))
+
+| Capability | Status |
 |---|---|
-| **Conversational booking** | Natural language via WhatsApp, powered by Claude |
-| **Real-time availability** | Google Calendar integration with slot locking |
-| **Full lifecycle** | Create, cancel, and modify appointments |
-| **Voice messages** | Audio transcribed via OpenAI Whisper |
-| **Smart dates** | "tomorrow", "next Wednesday", "next week" resolved to real dates |
-| **Reminders** | Automated WhatsApp messages 24h before appointments |
-| **Payments** | Optional Mercado Pago integration with checkout links |
-| **Multi-client ready** | YAML config + knowledge base per business, no code changes |
-| **Resilient state** | Redis in production, in-memory fallback for development |
+| Meta webhook receipt, HMAC signature validation | ✅ Working |
+| Multi-tenant routing (one deployment, many businesses) | ✅ Working |
+| Product catalog (via Meta Commerce Manager) | ❌ Not started |
+| Order-received webhook handling | ❌ Not started |
+| Payment link generation + gateway webhook (Razorpay) | ❌ Not started |
+| PDF invoice generation + delivery | ❌ Not started |
+| Onboarding wizard: catalog/payment-gateway setup | ❌ Not started |
 
 ---
 
-## Screenshots
-
-### Booking flow
-A client books a dental cleaning in natural language. The bot checks real-time availability, presents open slots, and confirms the appointment in Google Calendar.
-
-![Booking flow](public/screenshots/booking-flow.png)
-
-### Cancellation flow
-The bot finds the existing appointment, checks the cancellation policy (24h rule), and cancels with no fee.
-
-![Cancellation flow](public/screenshots/cancel-flow.png)
-
----
-
-## How it works
+## How it works (today)
 
 ```
-Client sends WhatsApp message
+Customer sends WhatsApp message
         │
         ▼
-┌─────────────────┐
-│  FastAPI webhook │ ◄── validates HMAC signature
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐     ┌──────────────┐
-│   Claude AI     │ ◄───│  Knowledge   │
-│  (conversation) │     │  base + config│
-└────────┬────────┘     └──────────────┘
-         │
-         │ extracts structured intent
-         ▼
-   ┌─────┴──────┐
-   │            │
-   ▼            ▼
-┌──────┐  ┌──────────┐
-│ Book │  │ Cancel/  │
-│      │  │ Modify   │
-└──┬───┘  └────┬─────┘
-   │           │
-   ▼           ▼
-┌─────────────────┐
-│ Google Calendar  │ ◄── real-time availability check
-└────────┬────────┘
-         │
-         ▼
-   Confirmation via WhatsApp
+┌───────────────────┐
+│   FastAPI webhook  │ ◄── validates per-tenant HMAC signature
+└─────────┬──────────┘
+          │
+          ▼
+┌───────────────────┐
+│  Resolve tenant by  │ ◄── multi-tenant routing: one deployment,
+│  phone_number_id    │     many businesses, each with its own
+└─────────┬──────────┘     Meta credentials
+          │
+          ▼
+┌───────────────────┐
+│  Reply with tenant's │ ◄── placeholder pending Phase 2's real
+│  welcome message     │     order-received handling (Spec.md 3.2)
+└───────────────────┘
 ```
 
----
-
-## Design principles
-
-- **No frameworks for the sake of frameworks.** Plain FastAPI with direct Anthropic SDK calls. No LangChain, no LangGraph. The problem is solved by ~50 lines of direct API calls.
-- **Config-driven, not code-driven.** New clients are onboarded by editing `config.yaml` and `knowledge/client.txt`. No code changes, no admin panel.
-- **Works offline from Redis.** Every stateful component has a Redis backend and an in-memory fallback. Run locally with zero infrastructure.
-- **Dates are pre-calculated.** LLMs are bad at date math. The system prompt injects the next 5 available booking dates on every request. Zero date hallucination.
-
-See [DECISIONS.md](DECISIONS.md) for the full rationale behind each technical choice.
+Once catalog/order support lands, the flow becomes: customer browses Meta's native catalog UI → taps "Add to cart" → taps "Send order" → this webhook receives an `order` message → replies with a summary + Razorpay payment link → payment webhook confirms → invoice sent as a WhatsApp document.
 
 ---
 
@@ -93,8 +64,8 @@ See [DECISIONS.md](DECISIONS.md) for the full rationale behind each technical ch
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/martin-minghetti/whatsapp-ai-receptionist.git
-cd whatsapp-ai-receptionist
+git clone https://github.com/daa-prime/whatsapp-commerce-bot.git
+cd whatsapp-commerce-bot
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
@@ -102,21 +73,15 @@ pip install -r requirements.txt
 
 ### 2. Configure
 
-```bash
-cp .env.example .env
-# Edit .env with your API keys
-```
+Create a `.env` file with:
 
-Required:
-- `ANTHROPIC_API_KEY` -- [Get one here](https://console.anthropic.com/)
-- `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` + `WHATSAPP_APP_SECRET` -- [Meta Developer Portal](https://developers.facebook.com/)
-- `WHATSAPP_VERIFY_TOKEN` -- any string you choose (must match webhook config)
-
-For booking (optional):
-- `GOOGLE_SERVICE_ACCOUNT_JSON` -- base64-encoded Google service account credentials
-- `GOOGLE_CALENDAR_ID` + `GOOGLE_CALENDAR_OWNER_EMAIL`
-
-Edit `config.yaml` with your business details and `knowledge/client.txt` with your knowledge base.
+- `DATABASE_URL` — a Postgres connection string (Neon recommended)
+- `WHATSAPP_ACCESS_TOKEN` + `WHATSAPP_PHONE_NUMBER_ID` + `WHATSAPP_APP_SECRET` — [Meta Developer Portal](https://developers.facebook.com/), for the one tenant seeded at startup
+- `WHATSAPP_VERIFY_TOKEN` — any string you choose (must match webhook config)
+- `ADMIN_SECRET` — protects the `/admin/onboard-tenant` form
+- `INTERNAL_SECRET` — protects the `/internal/*` cron-triggered endpoints
+- `REDIS_URL` (optional) — session/history/message-lock storage; falls back to in-memory if unset
+- `TENANT_NAME` (optional) — display name for the seeded tenant, defaults to "Default Tenant"
 
 ### 3. Run
 
@@ -124,54 +89,21 @@ Edit `config.yaml` with your business details and `knowledge/client.txt` with yo
 uvicorn core.main:app --reload
 ```
 
-### 4. Expose for WhatsApp
+The database schema is created (and the one tenant from your `.env` seeded) automatically on startup — no manual migration step for a fresh clone.
 
-Use [ngrok](https://ngrok.com/) for local development:
+### 4. Expose for WhatsApp
 
 ```bash
 ngrok http 8000
 ```
 
-Set the webhook URL in [Meta Developer Portal](https://developers.facebook.com/) -> WhatsApp -> Configuration:
+Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 - Callback URL: `https://your-ngrok-url.ngrok.io/webhook`
 - Verify token: same as your `WHATSAPP_VERIFY_TOKEN`
 
----
+### Onboarding additional tenants
 
-## Configuration
-
-### config.yaml
-
-```yaml
-client:
-  name: "Dr. Smith - Dentist"
-  timezone: "America/New_York"
-
-modules:
-  booking: true      # Enable appointment scheduling
-  payments: false    # Enable Mercado Pago payments
-  reminders: true    # Enable 24h reminders
-
-booking:
-  business_hours:
-    start: "09:00"
-    end: "18:00"
-  services:
-    - name: "Cleaning"
-      duration_minutes: 30
-      price: 15000
-    - name: "Consultation"
-      duration_minutes: 45
-      price: 20000
-  locations:
-    - name: "Main Office"
-      address: "123 Main St"
-      days: ["monday", "tuesday", "wednesday", "thursday", "friday"]
-```
-
-### knowledge/client.txt
-
-Free-text knowledge base about the business. The AI uses this to answer questions. Write it like you'd explain the business to a new receptionist.
+`GET /admin/onboard-tenant` — a plain server-rendered form (protected by `ADMIN_SECRET`) for adding businesses beyond the one seeded from `.env`. Collects tenant identity, Meta credentials, and a data-connection tier (this platform's own database, or a future connector to the business's existing system). Catalog and payment-gateway setup aren't collected here yet — that's Phase 7.
 
 ---
 
@@ -181,7 +113,7 @@ Free-text knowledge base about the business. The AI uses this to answer question
 pytest tests/ -v
 ```
 
-42 tests covering all modules -- webhook handling, AI intent extraction, calendar operations, payment flows, reminders, and configuration.
+70 tests across 7 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, and the onboarding form. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
 
 ---
 
@@ -195,9 +127,9 @@ The repo includes `railway.toml` ready to go:
 railway up
 ```
 
-Set environment variables in Railway dashboard. Add a cron job for reminders:
+Set environment variables in the Railway dashboard, pointed at a Neon Postgres instance. Add a cron job for the abandoned-cart-nudges placeholder (currently a no-op, earmarked for Phase 6):
 ```
-curl -X POST https://your-app.railway.app/internal/send-reminders \
+curl -X POST https://your-app.railway.app/internal/send-abandoned-cart-nudges \
   -H "X-Internal-Secret: $INTERNAL_SECRET"
 ```
 
@@ -214,34 +146,32 @@ uvicorn core.main:app --host 0.0.0.0 --port $PORT
 ## Architecture
 
 ```
-whatsapp-ai-receptionist/
+whatsapp-commerce-bot/
 ├── core/
-│   ├── main.py          # FastAPI app, webhook handlers, intent routing
-│   ├── ai.py            # Claude integration, system prompt, intent extraction
-│   ├── whatsapp.py      # WhatsApp Cloud API client
-│   ├── transcribe.py    # Whisper audio transcription
-│   ├── history.py       # Conversation history (Redis / in-memory)
-│   └── phone.py         # Phone number normalization
-├── config/
-│   └── loader.py        # YAML config with ${ENV_VAR} substitution
-├── modules/
-│   ├── booking/
-│   │   └── calendar.py  # Google Calendar with slot locking
-│   └── payments/
-│       └── mercadopago.py  # Mercado Pago checkout + webhook
+│   ├── main.py          # FastAPI app, webhook receipt/routing, message locking
+│   ├── whatsapp.py       # WhatsApp Cloud API client, signature validation, payload parsing
+│   ├── history.py        # Conversation history + session store (Redis / in-memory)
+│   └── phone.py          # Phone number normalization
+├── admin/
+│   └── onboarding.py     # Tenant onboarding form (/admin/onboard-tenant)
+├── db/
+│   ├── connection.py      # Postgres connection layer
+│   ├── schema.sql         # Data model (tenants; commerce tables land in Phase 5)
+│   ├── repository.py      # The only module that writes raw SQL
+│   ├── init_db.py         # Schema init + seed on startup
+│   └── seed.py            # Seed data (default tenant, test tenant)
 ├── reminders/
-│   └── scheduler.py     # 24h reminder sender
-├── knowledge/
-│   └── client.txt       # Business knowledge base
-├── config.yaml          # Per-client configuration
-└── tests/               # 42 tests, full coverage
+│   └── scheduler.py       # Abandoned-cart-nudges placeholder (Phase 6, not implemented)
+└── tests/                 # 70 tests
 ```
+
+See [Spec.md](Spec.md) for the full build spec and phase plan, and [DECISIONS.md](DECISIONS.md) for the architectural rationale carried over from the hospital-booking fork.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. The codebase is intentionally small and direct -- please keep it that way.
+Contributions are welcome. The codebase is intentionally small and direct — please keep it that way.
 
 1. Fork the repo
 2. Create a feature branch (`git checkout -b feature/your-feature`)
@@ -249,13 +179,6 @@ Contributions are welcome. The codebase is intentionally small and direct -- ple
 4. Open a pull request
 
 No issue template, no CLA. Just describe what you changed and why.
-
----
-
-## Community
-
-- **Issues**: [GitHub Issues](https://github.com/martin-minghetti/whatsapp-ai-receptionist/issues) -- bug reports, feature requests, questions
-- **Discussions**: [GitHub Discussions](https://github.com/martin-minghetti/whatsapp-ai-receptionist/discussions) -- ideas, show & tell, general chat
 
 ---
 
