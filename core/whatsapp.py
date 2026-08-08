@@ -11,8 +11,8 @@ WA_API_BASE = f"https://graph.facebook.com/{WA_API_VERSION}"
 
 
 def validate_webhook_signature(body: bytes, signature: str, app_secret: str | None) -> bool:
-    """Validate Meta webhook HMAC-SHA256 signature. app_secret is per-hospital
-    (SPEC Section 12.2/Phase 9) and can be None for a hospital that hasn't had
+    """Validate Meta webhook HMAC-SHA256 signature. app_secret is per-tenant
+    (multi-tenant routing) and can be None for a tenant that hasn't had
     one configured yet (e.g. mid-onboarding) — fail closed rather than raising,
     since hmac.new(None...) would otherwise crash the webhook handler."""
     if not app_secret or not signature.startswith("sha256="):
@@ -185,9 +185,9 @@ def parse_incoming_message(message: dict) -> dict:
 def extract_phone_number_id(change: dict) -> str | None:
     """
     The `value.metadata.phone_number_id` field in a Meta webhook payload identifies
-    *which* WhatsApp number received the message — i.e. which hospital it's for
-    (SPEC Section 12.2 multi-tenant routing). Not to be confused with `message["from"]`,
-    which is the sending *patient's* number. Centralized here for the same reason
+    *which* WhatsApp number received the message — i.e. which tenant it's for
+    (multi-tenant routing). Not to be confused with `message["from"]`,
+    which is the sending *customer's* number. Centralized here for the same reason
     as parse_incoming_message: nothing else in the app should touch Meta's raw shape.
     """
     return change.get("metadata", {}).get("phone_number_id")

@@ -11,18 +11,18 @@ import pytest
 # against which test file pytest happens to collect first.
 os.environ.setdefault("ADMIN_SECRET", "test-admin-secret")
 
-# SPEC Section 6/12.6: the app moved off SQLite onto Postgres (Neon), so tests
-# need a real Postgres to run against -- an in-memory swap-in-a-connection
-# trick (the old sqlite3.connect(":memory:") fixture) has no Postgres
-# equivalent. Two ways to provide that Postgres, both supported here:
+# The app runs on Postgres (Neon in production), so tests need a real Postgres
+# to run against -- an in-memory swap-in-a-connection trick (a plain
+# sqlite3.connect(":memory:") fixture) has no Postgres equivalent. Two ways to
+# provide that Postgres, both supported here:
 #
 #   1. testcontainers (default, no setup required) -- provisions a throwaway
 #      Postgres container automatically via the local Docker daemon. Chosen
-#      as the default because it reproduces what the old in-memory fixture
-#      gave every contributor for free: `pytest` just works on a fresh clone,
-#      with no manual "go install/configure Postgres yourself" step, on any
-#      machine or CI runner that already has Docker (which this project's
-#      Docker-based deploy path assumes anyway).
+#      as the default because it reproduces what an in-memory fixture gives
+#      every contributor for free: `pytest` just works on a fresh clone, with
+#      no manual "go install/configure Postgres yourself" step, on any machine
+#      or CI runner that already has Docker (which this project's Docker-based
+#      deploy path assumes anyway).
 #   2. TEST_DATABASE_URL env var -- if set, tests connect directly to that
 #      Postgres instead (a free-tier Neon branch, a local install, or a CI
 #      "services:" container) and testcontainers is never imported/started.
@@ -48,40 +48,39 @@ os.environ["DATABASE_URL"] = _test_database_url
 
 import db.connection as db_connection
 from db.init_db import init_db_on_connection
-from db.seed import seed_test_hospital
+from db.seed import seed_test_tenant
 
 
 @pytest.fixture(autouse=True)
 def _fresh_test_db():
     """
-    Fresh Postgres schema per test (SPEC Section 12.6 Tier 1, now Postgres/Neon
-    per Section 6) -- DROP/CREATE SCHEMA public gives every test the same
-    "nothing pre-exists" starting point the old sqlite3.connect(":memory:")
-    fixture gave for free, since a real Postgres instance can't be recreated
-    from scratch anywhere near as cheaply as an in-memory SQLite file could.
+    Fresh Postgres schema per test -- DROP/CREATE SCHEMA public gives every
+    test the same "nothing pre-exists" starting point an in-memory SQLite file
+    used to give for free, since a real Postgres instance can't be recreated
+    from scratch anywhere near as cheaply.
 
-    Also seeds a second, entirely fake hospital (SPEC Section 12.2/Phase 9) —
-    present in every test's DB so multi-tenant isolation tests don't each need
-    to seed it themselves, but never seeded in a real deployment (only this
-    fixture calls seed_test_hospital(), not db/init_db.py's production path).
+    Also seeds a second, entirely fake tenant — present in every test's DB so
+    multi-tenant isolation tests don't each need to seed it themselves, but
+    never seeded in a real deployment (only this fixture calls
+    seed_test_tenant(), not db/init_db.py's production path).
     """
     conn = db_connection._connect(_test_database_url)
     conn.execute("DROP SCHEMA public CASCADE")
     conn.execute("CREATE SCHEMA public")
-    seeded_hospital_id = init_db_on_connection(conn)
-    second_hospital_id = seed_test_hospital(conn)
+    seeded_tenant_id = init_db_on_connection(conn)
+    second_tenant_id = seed_test_tenant(conn)
     db_connection.set_connection(conn)
-    yield seeded_hospital_id, second_hospital_id
+    yield seeded_tenant_id, second_tenant_id
     db_connection.reset_connection()
 
 
 @pytest.fixture
-def hospital_id(_fresh_test_db):
-    """The id of the one 'real' hospital seeded into this test's fresh database."""
+def tenant_id(_fresh_test_db):
+    """The id of the one 'real' tenant seeded into this test's fresh database."""
     return _fresh_test_db[0]
 
 
 @pytest.fixture
-def second_hospital_id(_fresh_test_db):
-    """The id of the second, fake hospital seeded purely for isolation tests."""
+def second_tenant_id(_fresh_test_db):
+    """The id of the second, fake tenant seeded purely for isolation tests."""
     return _fresh_test_db[1]

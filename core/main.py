@@ -13,12 +13,10 @@ from fastapi.responses import PlainTextResponse
 
 import db.repository as db
 from admin.onboarding import router as onboarding_router
-from core.booking_flow import handle_incoming
 from core.history import get_history, get_session_store
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
 from db.init_db import init_db
-from reminders.scheduler import send_reminders
-from slots.scheduler import top_up_slots_for_hospital
+from reminders.scheduler import send_abandoned_cart_nudges
 
 # uvicorn only configures its own "uvicorn"/"uvicorn.error"/"uvicorn.access" loggers
 # (see uvicorn.config.LOGGING_CONFIG) — it never touches the root logger. Every logger
@@ -32,8 +30,8 @@ logger = logging.getLogger(__name__)
 
 HISTORY = get_history()
 SESSIONS = get_session_store()
-# Creates the schema + seeds the one real hospital from .env if not already present
-# (idempotent, safe on every startup — SPEC Section 12.6 Tier 1).
+# Creates the schema + seeds the one real tenant from .env if not already present
+# (idempotent, safe on every startup).
 init_db()
 
 VERIFY_TOKEN = os.environ["WHATSAPP_VERIFY_TOKEN"]
@@ -41,23 +39,23 @@ INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 
 _redis = None  # None = not yet checked; False = checked and unreachable; client = available
 
-# In-memory fallback for the per-(hospital, phone) message-processing lock (used when Redis is not available)
-_message_locks: dict[str, float] = {}  # "hospital_id:phone" -> lock expiry timestamp
+# In-memory fallback for the per-(tenant, phone) message-processing lock (used when Redis is not available)
+_message_locks: dict[str, float] = {}  # "tenant_id:phone" -> lock expiry timestamp
 
-# One WhatsAppClient per hospital, built lazily from that hospital's own DB-stored
-# credentials (SPEC Section 12.2) and reused for the life of the process — avoids
-# re-creating an httpx.AsyncClient (connection pool) on every message.
+# One WhatsAppClient per tenant, built lazily from that tenant's own DB-stored
+# credentials and reused for the life of the process — avoids re-creating an
+# httpx.AsyncClient (connection pool) on every message.
 _wa_clients: dict[int, WhatsAppClient] = {}
 
 
-def _get_whatsapp_client(hospital: db.Hospital) -> WhatsAppClient:
-    client = _wa_clients.get(hospital.id)
+def _get_whatsapp_client(tenant: db.Tenant) -> WhatsAppClient:
+    client = _wa_clients.get(tenant.id)
     if client is None:
         client = WhatsAppClient(
-            phone_number_id=hospital.whatsapp_phone_number_id,
-            access_token=hospital.access_token,
+            phone_number_id=tenant.whatsapp_phone_number_id,
+            access_token=tenant.access_token,
         )
-        _wa_clients[hospital.id] = client
+        _wa_clients[tenant.id] = client
     return client
 
 
@@ -81,11 +79,11 @@ def _get_redis():
     return _redis
 
 
-def _acquire_message_lock(hospital_id: int, phone: str, ttl: int = 15) -> bool:
-    """Try to acquire a processing lock for this (hospital, phone) pair. Returns
-    True if acquired. Scoped by hospital_id so the same phone number messaging
-    two different hospitals can never block itself across them (SPEC Section 12.2)."""
-    key_suffix = f"{hospital_id}:{phone}"
+def _acquire_message_lock(tenant_id: int, phone: str, ttl: int = 15) -> bool:
+    """Try to acquire a processing lock for this (tenant, phone) pair. Returns
+    True if acquired. Scoped by tenant_id so the same phone number messaging
+    two different tenants can never block itself across them."""
+    key_suffix = f"{tenant_id}:{phone}"
     r = _get_redis()
     if r:
         return bool(r.set(f"msg_lock:{key_suffix}", "1", nx=True, ex=ttl))
@@ -98,8 +96,8 @@ def _acquire_message_lock(hospital_id: int, phone: str, ttl: int = 15) -> bool:
     return True
 
 
-def _release_message_lock(hospital_id: int, phone: str):
-    key_suffix = f"{hospital_id}:{phone}"
+def _release_message_lock(tenant_id: int, phone: str):
+    key_suffix = f"{tenant_id}:{phone}"
     r = _get_redis()
     if r:
         r.delete(f"msg_lock:{key_suffix}")
@@ -148,29 +146,29 @@ async def receive_message(request: Request):
         entry = data["entry"][0]
         change = entry["changes"][0]["value"]
 
-        # SPEC Section 12.2: resolve which hospital this message is *for* (the
-        # WhatsApp number that received it, from `metadata` — not the sender's
-        # number, which is `message["from"]` below) BEFORE trusting/validating
-        # anything else in the payload. This is a structural read of routing
-        # metadata only, not "processing the message" — nothing here acts on the
-        # message content, sends anything, or touches booking/session state; that
-        # all happens further down, strictly after signature verification passes.
+        # Resolve which tenant this message is *for* (the WhatsApp number that
+        # received it, from `metadata` — not the sender's number, which is
+        # `message["from"]` below) BEFORE trusting/validating anything else in
+        # the payload. This is a structural read of routing metadata only, not
+        # "processing the message" — nothing here acts on the message content,
+        # sends anything, or touches order/session state; that all happens
+        # further down, strictly after signature verification passes.
         incoming_phone_number_id = extract_phone_number_id(change)
-        hospital = db.find_hospital_by_phone_number_id(incoming_phone_number_id)
-        if hospital is None:
+        tenant = db.find_tenant_by_phone_number_id(incoming_phone_number_id)
+        if tenant is None:
             logger.warning(
-                "Webhook received for unrecognized/inactive phone_number_id=%s — no matching hospital, ignoring",
+                "Webhook received for unrecognized/inactive phone_number_id=%s — no matching tenant, ignoring",
                 incoming_phone_number_id,
             )
             return Response(status_code=200)
 
-        # Each hospital has its own app_secret (SPEC Section 4's app_secret_ref) —
-        # verify against *that* hospital's secret, not a single global one. A
-        # payload signed with hospital A's secret can never pass for hospital B's
-        # phone_number_id, even though both are handled by this one endpoint.
+        # Each tenant has its own app_secret — verify against *that* tenant's
+        # secret, not a single global one. A payload signed with tenant A's
+        # secret can never pass for tenant B's phone_number_id, even though
+        # both are handled by this one endpoint.
         signature = request.headers.get("X-Hub-Signature-256", "")
-        if not validate_webhook_signature(body, signature, hospital.app_secret):
-            logger.warning("Invalid webhook signature for hospital_id=%s (phone_number_id=%s)", hospital.id, incoming_phone_number_id)
+        if not validate_webhook_signature(body, signature, tenant.app_secret):
+            logger.warning("Invalid webhook signature for tenant_id=%s (phone_number_id=%s)", tenant.id, incoming_phone_number_id)
             raise HTTPException(status_code=403, detail="Invalid signature")
 
         # Ignore status updates (delivered, read, etc.) — after signature
@@ -182,11 +180,11 @@ async def receive_message(request: Request):
         message = change["messages"][0]
         phone = message["from"]
         reply = parse_incoming_message(message)
-        wa = _get_whatsapp_client(hospital)
+        wa = _get_whatsapp_client(tenant)
 
         if reply["type"] == "audio":
             # No transcription pipeline (no AI/LLM in this build) — bypass the state
-            # machine entirely and tell the patient to use text instead.
+            # machine entirely and tell the customer to use text instead.
             await wa.send_text(phone, "I couldn't process your audio. Could you send it as text instead?")
             return Response(status_code=200)
 
@@ -194,56 +192,54 @@ async def receive_message(request: Request):
         logger.warning("Malformed or unexpected webhook payload, ignoring: %s", body[:500])
         return Response(status_code=200)
 
-    # Prevent concurrent processing for the same (hospital, phone) pair
-    if not _acquire_message_lock(hospital.id, phone):
-        logger.info("Message from %s (hospital %s) skipped (already processing)", phone, hospital.id)
+    # Prevent concurrent processing for the same (tenant, phone) pair
+    if not _acquire_message_lock(tenant.id, phone):
+        logger.info("Message from %s (tenant %s) skipped (already processing)", phone, tenant.id)
         return Response(status_code=200)
 
-    logger.info("Message lock acquired for %s (hospital %s), type=%s", phone, hospital.id, reply["type"])
+    logger.info("Message lock acquired for %s (tenant %s), type=%s", phone, tenant.id, reply["type"])
     try:
-        await _process_message(wa, hospital, phone, reply)
+        await _process_message(wa, tenant, phone, reply)
     finally:
-        _release_message_lock(hospital.id, phone)
+        _release_message_lock(tenant.id, phone)
 
     return Response(status_code=200)
 
 
-async def _process_message(wa: WhatsAppClient, hospital: db.Hospital, phone: str, reply: dict) -> None:
-    """Process a single already-parsed incoming message with the (hospital, phone) lock already held."""
-    logger.info("Dispatching message from %s (hospital %s) to booking_flow: %s", phone, hospital.id, reply)
+async def _process_message(wa: WhatsAppClient, tenant: db.Tenant, phone: str, reply: dict) -> None:
+    """Process a single already-parsed incoming message with the (tenant, phone)
+    lock already held.
+
+    Placeholder until Phase 2 builds the order-received webhook handler
+    (SPEC.md Section 3.2): for now every message just gets the tenant's
+    welcome message back, which proves the webhook/signature/routing/lock
+    plumbing above works end-to-end without any order/cart logic yet. Meta's
+    native catalog/cart messages (SPEC.md Section 2) are what will actually
+    drive customers to this bot; Phase 1 wires up a real test catalog, Phase 2
+    replaces this stub with parsing the resulting `order` message type.
+    """
+    logger.info("Dispatching message from %s (tenant %s): %s", phone, tenant.id, reply)
     HISTORY.add(phone, "user", reply.get("text") or reply.get("title") or f"[{reply.get('type')}]")
-    await handle_incoming(wa, SESSIONS, phone, hospital.id, reply, hospital.name)
-    logger.info("booking_flow.handle_incoming returned for %s", phone)
+    welcome = tenant.welcome_message_text or f"Welcome to {tenant.name}! Our catalog is coming soon."
+    await wa.send_text(phone, welcome)
 
 
-@app.post("/internal/send-reminders")
-async def trigger_reminders(request: Request):
-    """Hit by an external cron job (SPEC Section 3.5) — not an in-process scheduler.
-    Loops over every active hospital (SPEC Section 12.2), sending each one's
-    reminders with its own credentials and its own reminder_offsets_hours."""
+@app.post("/internal/send-abandoned-cart-nudges")
+async def trigger_abandoned_cart_nudges(request: Request):
+    """Hit by an external cron job — not an in-process scheduler, same pattern
+    as this endpoint's predecessor. Loops over every active tenant, sending
+    each one's abandoned-cart nudges with its own credentials.
+
+    Earmarked for SPEC.md Phase 6 — reminders/scheduler.py's
+    send_abandoned_cart_nudges() is a no-op placeholder until the order/cart
+    data model (Phase 5) exists, so this always reports 0 sent for now."""
     secret = request.headers.get("X-Internal-Secret", "")
     if secret != INTERNAL_SECRET:
         raise HTTPException(status_code=403)
 
-    sent_by_hospital = {}
-    for hospital in db.get_active_hospitals():
-        wa = _get_whatsapp_client(hospital)
-        sent_by_hospital[hospital.name] = await send_reminders(wa, hospital.id, hospital.reminder_offsets_hours)
+    sent_by_tenant = {}
+    for tenant in db.get_active_tenants():
+        wa = _get_whatsapp_client(tenant)
+        sent_by_tenant[tenant.name] = await send_abandoned_cart_nudges(wa, tenant.id)
 
-    return {"sent": sum(sent_by_hospital.values()), "by_hospital": sent_by_hospital}
-
-
-@app.post("/internal/top-up-slots")
-async def trigger_slot_top_up(request: Request):
-    """Hit by an external cron job (SPEC Section 12.1.1), same pattern as
-    /internal/send-reminders above. Loops every active hospital and extends
-    each of its doctors' rolling doctor_slots window forward as days pass."""
-    secret = request.headers.get("X-Internal-Secret", "")
-    if secret != INTERNAL_SECRET:
-        raise HTTPException(status_code=403)
-
-    generated_by_hospital = {
-        hospital.name: top_up_slots_for_hospital(hospital.id)
-        for hospital in db.get_active_hospitals()
-    }
-    return {"generated": sum(generated_by_hospital.values()), "by_hospital": generated_by_hospital}
+    return {"sent": sum(sent_by_tenant.values()), "by_tenant": sent_by_tenant}

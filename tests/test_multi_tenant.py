@@ -1,22 +1,27 @@
 # tests/test_multi_tenant.py
 """
-SPEC Section 12.2 / Phase 9: multi-tenant routing isolation.
+Multi-tenant routing isolation.
 
-hospital_id/second_hospital_id fixtures come from tests/conftest.py — every
-test here gets a fresh DB with both the one "real" hospital (whatsapp_phone_number_id
+tenant_id/second_tenant_id fixtures come from tests/conftest.py — every test
+here gets a fresh DB with both the one "real" tenant (whatsapp_phone_number_id
 "123" by default) and a second, entirely fake one (whatsapp_phone_number_id
-"TEST_HOSPITAL_2_PHONE_ID") already seeded with distinct departments/doctors.
+"TEST_TENANT_2_PHONE_ID") already seeded.
+
+Phase 0: the hospital product's department/appointment isolation tests are
+gone along with that domain logic. What's left here is the tenant-routing
+plumbing (signature validation, unrecognized/deactivated numbers, per-tenant
+session isolation) that's genuinely reusable infrastructure — plus a
+replacement test for the abandoned-cart-nudges placeholder endpoint that
+succeeded reminders/scheduler.py's old appointment-reminders endpoint.
 """
 import hashlib
 import hmac
 import json
 import os
-from datetime import datetime, timedelta
 
 import pytest
 
 import db.repository as db
-from core.booking_flow import handle_incoming
 from core.history import InMemorySessionStore
 
 # Same defensive env-var setup as tests/test_main.py — core.main is only
@@ -28,8 +33,6 @@ os.environ.setdefault("WHATSAPP_PHONE_NUMBER_ID", "123")
 os.environ.setdefault("WHATSAPP_VERIFY_TOKEN", "mytoken")
 os.environ.setdefault("WHATSAPP_APP_SECRET", "appsecret")
 os.environ.setdefault("INTERNAL_SECRET", "internalsecret")
-os.environ.setdefault("GOOGLE_CALENDAR_ID", "test@calendar")
-os.environ.setdefault("GOOGLE_CALENDAR_OWNER_EMAIL", "test@test.com")
 # DATABASE_URL is already pointed at the test Postgres instance by
 # tests/conftest.py (loaded before this module).
 
@@ -38,155 +41,37 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(app)
 
-PHONE = "5491112345678"  # deliberately the SAME phone used against both hospitals below
-
-
-class FakeWhatsAppClient:
-    def __init__(self):
-        self.sent = []
-
-    async def send_text(self, to, text):
-        self.sent.append(("text", {"to": to, "text": text}))
-
-    async def send_list(self, to, body_text, button_text, sections, header_text=None, footer_text=None):
-        self.sent.append(("list", {"to": to, "body_text": body_text, "sections": sections}))
-
-    async def send_buttons(self, to, body_text, buttons, header_text=None, footer_text=None):
-        self.sent.append(("buttons", {"to": to, "body_text": body_text, "buttons": buttons}))
-
-
-def tap(option_id, title=""):
-    return {"type": "interactive_reply", "id": option_id, "title": title}
-
-
-def text_reply(text):
-    return {"type": "text", "text": text}
-
-
-def _row_ids(kind_kwargs):
-    return {row["id"] for section in kind_kwargs["sections"] for row in section["rows"]}
+PHONE = "5491112345678"  # deliberately the SAME phone used against both tenants below
 
 
 def _sign(body: bytes) -> str:
     return "sha256=" + hmac.new(b"appsecret", body, hashlib.sha256).hexdigest()
 
 
-# --- Departments never leak across hospitals ---
+# --- Conversation/session state never leaks across tenants ---
 
-@pytest.mark.asyncio
-async def test_department_menu_isolated_between_hospitals(hospital_id, second_hospital_id):
-    wa = FakeWhatsAppClient()
-    sessions = InMemorySessionStore()
+def test_same_phone_has_independent_conversation_state_per_tenant():
+    """The session store is keyed by (tenant_id, phone) — the same customer
+    mid-conversation at tenant A must not resume that state when messaging
+    tenant B."""
+    sessions = InMemorySessionStore()  # a single shared store, as core/main.py's SESSIONS actually is
 
-    await handle_incoming(wa, sessions, PHONE, hospital_id, tap("menu_book"))
-    hospital_a_depts = _row_ids(wa.sent[-1][1])
+    sessions.set(1, PHONE, "AWAITING_PAYMENT", {"order_id": 1})
+    assert sessions.get(1, PHONE)["state"] == "AWAITING_PAYMENT"
 
-    wa2 = FakeWhatsAppClient()
-    sessions2 = InMemorySessionStore()
-    await handle_incoming(wa2, sessions2, PHONE, second_hospital_id, tap("menu_book"))
-    hospital_b_depts = _row_ids(wa2.sent[-1][1])
+    # Tenant 2's conversation for the same phone starts completely fresh.
+    assert sessions.get(2, PHONE) == {"state": "IDLE", "context": {}}
 
-    assert hospital_a_depts == {"cardiology", "orthopedics", "general_medicine", "pediatrics"}
-    assert hospital_b_depts == {"t2_neurology", "t2_dermatology"}
-    assert hospital_a_depts.isdisjoint(hospital_b_depts)
-
-
-@pytest.mark.asyncio
-async def test_hospital_a_department_id_rejected_when_tapped_against_hospital_b(hospital_id, second_hospital_id):
-    """Even if a patient's client somehow replayed hospital A's department row id
-    against hospital B's conversation, it must not resolve — find_department()
-    is scoped by hospital_id, not just id."""
-    wa = FakeWhatsAppClient()
-    sessions = InMemorySessionStore()
-    sessions.set(second_hospital_id, PHONE, "AWAITING_DEPARTMENT", {})
-
-    await handle_incoming(wa, sessions, PHONE, second_hospital_id, tap("cardiology"))  # hospital A's department id
-
-    # Treated as an invalid/unrecognized tap -> re-prompt, not accepted.
-    assert wa.sent[0] == ("text", {"to": PHONE, "text": "Please choose an option from the list above"})
-    assert sessions.get(second_hospital_id, PHONE)["state"] == "AWAITING_DEPARTMENT"
-
-
-# --- Appointments never leak across hospitals' cancel/reschedule lists ---
-
-@pytest.mark.asyncio
-async def test_appointment_never_appears_in_other_hospitals_cancel_list(hospital_id, second_hospital_id):
-    # Hospital A has an appointment for PHONE...
-    db.create_appointment(hospital_id, PHONE, "cardiology", "doc_card_1", datetime.now() + timedelta(hours=24))
-
-    # ...but the SAME phone number messaging hospital B sees no appointments to cancel.
-    wa = FakeWhatsAppClient()
-    sessions = InMemorySessionStore()
-    await handle_incoming(wa, sessions, PHONE, second_hospital_id, tap("menu_cancel"))
-
-    assert wa.sent == [("text", {"to": PHONE, "text": "You don't have any upcoming appointments to cancel."})]
-
-    # Meanwhile hospital A's own cancel flow still sees it correctly.
-    wa_a = FakeWhatsAppClient()
-    sessions_a = InMemorySessionStore()
-    await handle_incoming(wa_a, sessions_a, PHONE, hospital_id, tap("menu_cancel"))
-    assert wa_a.sent[-1][0] == "list"
-
-
-@pytest.mark.asyncio
-async def test_appointment_never_appears_in_other_hospitals_reschedule_list(hospital_id, second_hospital_id):
-    db.create_appointment(hospital_id, PHONE, "cardiology", "doc_card_1", datetime.now() + timedelta(hours=24))
-
-    wa = FakeWhatsAppClient()
-    sessions = InMemorySessionStore()
-    await handle_incoming(wa, sessions, PHONE, second_hospital_id, tap("menu_reschedule"))
-
-    assert wa.sent == [("text", {"to": PHONE, "text": "You don't have any upcoming appointments to reschedule."})]
-
-
-@pytest.mark.asyncio
-async def test_appointment_id_from_hospital_a_rejected_if_replayed_against_hospital_b(hospital_id, second_hospital_id):
-    """Same defense-in-depth check as the department test above, for the
-    appt_<id> row ids used by the cancel/reschedule selection menus."""
-    appt = db.create_appointment(hospital_id, PHONE, "cardiology", "doc_card_1", datetime.now() + timedelta(hours=24))
-
-    wa = FakeWhatsAppClient()
-    sessions = InMemorySessionStore()
-    sessions.set(second_hospital_id, PHONE, "AWAITING_CANCEL_SELECTION", {})
-
-    await handle_incoming(wa, sessions, PHONE, second_hospital_id, tap(f"appt_{appt.id}"))
-
-    # Hospital B has no appointments at all, so this looks exactly like "went
-    # stale"/nothing to cancel -- either way, hospital A's appointment must not
-    # get cancelled by a hospital-B conversation.
-    assert db.get_appointment(hospital_id, appt.id).status == db.STATUS_BOOKED
-
-
-# --- Conversation/session state never leaks across hospitals ---
-
-@pytest.mark.asyncio
-async def test_same_phone_has_independent_conversation_state_per_hospital():
-    """SPEC Section 12.2: the session store is keyed by (hospital_id, phone) —
-    the same patient mid-booking at hospital A must not resume that flow when
-    messaging hospital B."""
-    from core.history import InMemorySessionStore as Store
-    sessions = Store()  # a single shared store, as core/main.py's SESSIONS actually is
-
-    wa_a = FakeWhatsAppClient()
-    await handle_incoming(wa_a, sessions, PHONE, 1, tap("menu_book"))
-    assert sessions.get(1, PHONE)["state"] == "AWAITING_DEPARTMENT"
-
-    # Hospital 2's conversation for the same phone starts completely fresh.
-    wa_b = FakeWhatsAppClient()
-    await handle_incoming(wa_b, sessions, PHONE, 2, text_reply("hi"))
-    assert sessions.get(2, PHONE)["state"] == "IDLE"
-    assert wa_b.sent[-1][0] == "list"  # got the main menu, not treated as an AWAITING_DEPARTMENT reply
-
-    # And hospital 1's state is untouched by hospital 2's conversation.
-    assert sessions.get(1, PHONE)["state"] == "AWAITING_DEPARTMENT"
+    # And tenant 1's state is untouched by reading tenant 2's.
+    assert sessions.get(1, PHONE)["state"] == "AWAITING_PAYMENT"
 
 
 # --- Unrecognized phone_number_id ---
 
 def test_unrecognized_phone_number_id_ignored_without_crashing(httpx_mock):
-    """A webhook for a phone_number_id that doesn't match any hospital in the
+    """A webhook for a phone_number_id that doesn't match any tenant in the
     database must be safely ignored: 200 OK, no processing, no outbound send —
-    not a crash, not a silent default-hospital assumption."""
+    not a crash, not a silent default-tenant assumption."""
     body = json.dumps({
         "entry": [{"changes": [{"value": {
             "metadata": {"phone_number_id": "SOME_UNKNOWN_NUMBER_NOBODY_OWNS"},
@@ -217,39 +102,38 @@ def test_recognized_phone_number_id_is_processed_normally(httpx_mock):
     assert len(httpx_mock.get_requests()) == 1
 
 
-def test_deactivated_hospital_phone_number_id_treated_as_unrecognized(hospital_id):
-    """is_active=0 must be treated the same as "no such hospital" — not routed to."""
+def test_deactivated_tenant_phone_number_id_treated_as_unrecognized(tenant_id):
+    """is_active=0 must be treated the same as "no such tenant" — not routed to."""
     import db.connection as db_connection
     conn = db_connection.get_connection()
-    conn.execute("UPDATE hospitals SET is_active = 0 WHERE id = ?", (hospital_id,))
+    conn.execute("UPDATE tenants SET is_active = 0 WHERE id = ?", (tenant_id,))
     conn.commit()
 
-    assert db.find_hospital_by_phone_number_id("123") is None
+    assert db.find_tenant_by_phone_number_id("123") is None
 
 
-# --- Per-hospital webhook signature validation ---
+# --- Per-tenant webhook signature validation ---
 
-def _set_app_secret(hospital_id: int, secret: str) -> None:
+def _set_app_secret(tenant_id: int, secret: str) -> None:
     import db.connection as db_connection
     conn = db_connection.get_connection()
-    conn.execute("UPDATE hospitals SET app_secret_ref = ? WHERE id = ?", (secret, hospital_id))
+    conn.execute("UPDATE tenants SET app_secret_ref = ? WHERE id = ?", (secret, tenant_id))
     conn.commit()
 
 
-def test_hospital_a_secret_cannot_validate_a_payload_claiming_to_be_hospital_b(hospital_id, second_hospital_id, httpx_mock):
-    """Each hospital has its own app_secret (SPEC Section 4/12.2). A payload
-    claiming to be for hospital B's phone_number_id but signed with hospital
-    A's secret must be rejected, even though both hospitals share this one
-    webhook endpoint."""
-    _set_app_secret(second_hospital_id, "hospital-b-real-secret")
+def test_tenant_a_secret_cannot_validate_a_payload_claiming_to_be_tenant_b(tenant_id, second_tenant_id, httpx_mock):
+    """Each tenant has its own app_secret. A payload claiming to be for tenant
+    B's phone_number_id but signed with tenant A's secret must be rejected,
+    even though both tenants share this one webhook endpoint."""
+    _set_app_secret(second_tenant_id, "tenant-b-real-secret")
 
     body = json.dumps({
         "entry": [{"changes": [{"value": {
-            "metadata": {"phone_number_id": "TEST_HOSPITAL_2_PHONE_ID"},  # claims to be hospital B
+            "metadata": {"phone_number_id": "TEST_TENANT_2_PHONE_ID"},  # claims to be tenant B
             "messages": [{"from": "919999999994", "type": "text", "text": {"body": "hi"}}],
         }}]}]
     }).encode()
-    forged_sig = _sign(body)  # _sign() = hospital A's real secret ("appsecret"), not hospital B's
+    forged_sig = _sign(body)  # _sign() = tenant A's real secret ("appsecret"), not tenant B's
 
     resp = client.post("/webhook", content=body,
                         headers={"X-Hub-Signature-256": forged_sig, "Content-Type": "application/json"})
@@ -258,20 +142,20 @@ def test_hospital_a_secret_cannot_validate_a_payload_claiming_to_be_hospital_b(h
     assert len(httpx_mock.get_requests()) == 0  # never got far enough to process/send anything
 
 
-def test_hospital_b_own_secret_correctly_validates_its_own_payload(hospital_id, second_hospital_id, httpx_mock):
-    """Sanity complement to the test above: hospital B's OWN secret correctly
-    signs and passes for hospital B's own phone_number_id — proves this is
-    genuine per-hospital validation, not "everything for hospital B fails"."""
-    _set_app_secret(second_hospital_id, "hospital-b-real-secret")
-    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/TEST_HOSPITAL_2_PHONE_ID/messages", json={"messages": [{"id": "x"}]})
+def test_tenant_b_own_secret_correctly_validates_its_own_payload(tenant_id, second_tenant_id, httpx_mock):
+    """Sanity complement to the test above: tenant B's OWN secret correctly
+    signs and passes for tenant B's own phone_number_id — proves this is
+    genuine per-tenant validation, not "everything for tenant B fails"."""
+    _set_app_secret(second_tenant_id, "tenant-b-real-secret")
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/TEST_TENANT_2_PHONE_ID/messages", json={"messages": [{"id": "x"}]})
 
     body = json.dumps({
         "entry": [{"changes": [{"value": {
-            "metadata": {"phone_number_id": "TEST_HOSPITAL_2_PHONE_ID"},
+            "metadata": {"phone_number_id": "TEST_TENANT_2_PHONE_ID"},
             "messages": [{"from": "919999999993", "type": "text", "text": {"body": "hi"}}],
         }}]}]
     }).encode()
-    real_sig = "sha256=" + hmac.new(b"hospital-b-real-secret", body, hashlib.sha256).hexdigest()
+    real_sig = "sha256=" + hmac.new(b"tenant-b-real-secret", body, hashlib.sha256).hexdigest()
 
     resp = client.post("/webhook", content=body,
                         headers={"X-Hub-Signature-256": real_sig, "Content-Type": "application/json"})
@@ -280,13 +164,13 @@ def test_hospital_b_own_secret_correctly_validates_its_own_payload(hospital_id, 
     assert len(httpx_mock.get_requests()) == 1
 
 
-def test_hospital_with_no_app_secret_configured_rejects_all_signatures(second_hospital_id):
-    """A hospital that hasn't had app_secret_ref set yet (e.g. mid-onboarding)
+def test_tenant_with_no_app_secret_configured_rejects_all_signatures(second_tenant_id):
+    """A tenant that hasn't had app_secret_ref set yet (e.g. mid-onboarding)
     must fail closed, not crash — see core/whatsapp.py:validate_webhook_signature."""
-    # second_hospital_id's app_secret is NULL by default (seed_test_hospital doesn't set one).
+    # second_tenant_id's app_secret is NULL by default (seed_test_tenant doesn't set one).
     body = json.dumps({
         "entry": [{"changes": [{"value": {
-            "metadata": {"phone_number_id": "TEST_HOSPITAL_2_PHONE_ID"},
+            "metadata": {"phone_number_id": "TEST_TENANT_2_PHONE_ID"},
             "messages": [{"from": "919999999992", "type": "text", "text": {"body": "hi"}}],
         }}]}]
     }).encode()
@@ -298,26 +182,22 @@ def test_hospital_with_no_app_secret_configured_rejects_all_signatures(second_ho
     assert resp.status_code == 403  # rejected cleanly, not a 500
 
 
-# --- Reminders loop over active hospitals with each one's own data ---
+# --- Abandoned-cart-nudges placeholder endpoint loops over active tenants ---
 
-@pytest.mark.asyncio
-async def test_reminders_endpoint_sends_separately_to_each_active_hospital(hospital_id, second_hospital_id, httpx_mock):
-    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "a"}]})
-    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/TEST_HOSPITAL_2_PHONE_ID/messages", json={"messages": [{"id": "b"}]})
-
-    db.create_appointment(hospital_id, "111", "cardiology", "doc_card_1", datetime.now() + timedelta(hours=5))
-    db.create_appointment(second_hospital_id, "222", "t2_neurology", "t2_doc_neuro_1", datetime.now() + timedelta(hours=5))
-
-    resp = client.post("/internal/send-reminders", headers={"X-Internal-Secret": "internalsecret"})
+def test_abandoned_cart_nudges_endpoint_reports_per_tenant(tenant_id, second_tenant_id):
+    """Phase 0: reminders/scheduler.py's send_abandoned_cart_nudges() is a
+    no-op placeholder (no order/cart model exists until Phase 5), but the
+    /internal/* cron-triggered-endpoint shape itself — looping every active
+    tenant with its own client — must already work end-to-end."""
+    resp = client.post("/internal/send-abandoned-cart-nudges", headers={"X-Internal-Secret": "internalsecret"})
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["sent"] == 2
-    assert body["by_hospital"]["Default Hospital"] == 1
-    assert body["by_hospital"]["Test Hospital 2"] == 1
+    assert body["sent"] == 0
+    assert body["by_tenant"]["Default Tenant"] == 0
+    assert body["by_tenant"]["Test Tenant 2"] == 0
 
-    # Each hospital's reminder actually went to its own phone number, via its own number.
-    requests = httpx_mock.get_requests()
-    urls = {str(r.url) for r in requests}
-    assert "https://graph.facebook.com/v22.0/123/messages" in urls
-    assert "https://graph.facebook.com/v22.0/TEST_HOSPITAL_2_PHONE_ID/messages" in urls
+
+def test_abandoned_cart_nudges_endpoint_requires_internal_secret():
+    resp = client.post("/internal/send-abandoned-cart-nudges", headers={"X-Internal-Secret": "wrong"})
+    assert resp.status_code == 403

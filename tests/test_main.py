@@ -10,8 +10,6 @@ os.environ.setdefault("WHATSAPP_PHONE_NUMBER_ID", "123")
 os.environ.setdefault("WHATSAPP_VERIFY_TOKEN", "mytoken")
 os.environ.setdefault("WHATSAPP_APP_SECRET", "appsecret")
 os.environ.setdefault("INTERNAL_SECRET", "internalsecret")
-os.environ.setdefault("GOOGLE_CALENDAR_ID", "test@calendar")
-os.environ.setdefault("GOOGLE_CALENDAR_OWNER_EMAIL", "test@test.com")
 # core.main calls db.init_db.init_db() at import time (module-level, before any
 # pytest fixture runs) -- DATABASE_URL is already pointed at the test Postgres
 # instance by tests/conftest.py (loaded before this module), so importing this
@@ -49,9 +47,9 @@ def test_webhook_verification_wrong_token():
 
 def test_webhook_invalid_signature():
     """Bad signature on an otherwise well-formed payload for a REAL, recognized
-    hospital (phone_number_id="123") -- must still be rejected with 403. (A
+    tenant (phone_number_id="123") -- must still be rejected with 403. (A
     structurally-incomplete payload can't reach the signature check at all
-    anymore, since resolving which hospital's secret to check against requires
+    anymore, since resolving which tenant's secret to check against requires
     parsing that far first -- see the malformed-payload tests below instead.)"""
     body = json.dumps({
         "entry": [{"changes": [{"value": {
@@ -120,8 +118,8 @@ def test_entry_present_but_not_a_list_returns_200():
 def test_reaction_message_type_ignored_gracefully(httpx_mock):
     """A message type this app doesn't specifically parse (e.g. a reaction) must
     fall through to the "unsupported" path, not crash — it still reaches
-    booking_flow (unlike the structurally-malformed cases above), which will
-    reply with the main menu, so the outbound send needs mocking."""
+    _process_message (unlike the structurally-malformed cases above), which
+    replies with the tenant's welcome message, so the outbound send needs mocking."""
     httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "wamid.x"}]})
     body = json.dumps({
         "entry": [{"changes": [{"value": {
@@ -178,10 +176,10 @@ def test_webhook_returns_200_even_when_whatsapp_send_fails_with_5xx(httpx_mock):
 # simulate "another request is already mid-flight" through the real endpoint,
 # then directly at the unit level.
 
-def test_locked_phone_skips_processing_but_still_acks_200(httpx_mock, hospital_id):
+def test_locked_phone_skips_processing_but_still_acks_200(httpx_mock, tenant_id):
     import core.main as m
     phone = "919999999997"
-    assert m._acquire_message_lock(hospital_id, phone) is True  # simulate a request already in flight
+    assert m._acquire_message_lock(tenant_id, phone) is True  # simulate a request already in flight
 
     body = json.dumps({
         "entry": [{"changes": [{"value": {
@@ -196,14 +194,14 @@ def test_locked_phone_skips_processing_but_still_acks_200(httpx_mock, hospital_i
     # No WhatsApp send was attempted -- the message was skipped, not processed twice.
     assert len(httpx_mock.get_requests()) == 0
 
-    m._release_message_lock(hospital_id, phone)
+    m._release_message_lock(tenant_id, phone)
 
 
-def test_acquire_message_lock_blocks_second_call_until_released(hospital_id):
+def test_acquire_message_lock_blocks_second_call_until_released(tenant_id):
     import core.main as m
     phone = "919999999996"
-    assert m._acquire_message_lock(hospital_id, phone) is True
-    assert m._acquire_message_lock(hospital_id, phone) is False  # still held
-    m._release_message_lock(hospital_id, phone)
-    assert m._acquire_message_lock(hospital_id, phone) is True  # available again
-    m._release_message_lock(hospital_id, phone)
+    assert m._acquire_message_lock(tenant_id, phone) is True
+    assert m._acquire_message_lock(tenant_id, phone) is False  # still held
+    m._release_message_lock(tenant_id, phone)
+    assert m._acquire_message_lock(tenant_id, phone) is True  # available again
+    m._release_message_lock(tenant_id, phone)

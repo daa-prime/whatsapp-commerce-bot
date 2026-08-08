@@ -3,9 +3,9 @@
 Thin connection layer — the only place that knows this is Postgres (SPEC
 Section 6/12.6: moved off SQLite before real production load, onto Neon).
 Swapping the backend again later means changing this file and db/schema.sql,
-not touching db/repository.py's callers (core/booking_flow.py,
-reminders/scheduler.py, slots/scheduler.py) — those only ever call
-get_connection() and use the connection's .execute()/.commit() methods.
+not touching db/repository.py's callers (core/main.py, admin/onboarding.py) —
+those only ever call get_connection() and use the connection's
+.execute()/.commit() methods.
 
 _PGConnection below is a thin adapter, not a different database abstraction:
 it exists purely so db/repository.py's existing conn.execute(sql, params)
@@ -36,10 +36,10 @@ import psycopg2
 import psycopg2.extras
 
 # Re-exported so every other module that needs to catch a constraint
-# violation (core/booking_flow.py's double-booking race, admin/onboarding.py's
-# duplicate phone_number_id) imports it from here rather than knowing which
-# driver is underneath — this is the one piece of driver knowledge those
-# modules previously had to have directly (as `sqlite3.IntegrityError`).
+# violation (admin/onboarding.py's duplicate phone_number_id) imports it from
+# here rather than knowing which driver is underneath — this is the one piece
+# of driver knowledge those modules previously had to have directly (as
+# `sqlite3.IntegrityError`).
 IntegrityError = psycopg2.IntegrityError
 
 _QUESTION_MARK_RE = re.compile(r"\?")
@@ -55,9 +55,8 @@ class _PGConnection:
         self._conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
         # Critical behavioral difference from SQLite: Postgres aborts the
         # *entire* transaction after any failed statement (e.g. the
-        # IntegrityError core/booking_flow.py's double-booking race and
-        # admin/onboarding.py's duplicate-phone_number_id catch are built
-        # around) -- every subsequent statement on that connection would raise
+        # IntegrityError admin/onboarding.py's duplicate-phone_number_id catch
+        # is built around) -- every subsequent statement on that connection would raise
         # "current transaction is aborted" until a ROLLBACK, even unrelated
         # SELECTs, unless autocommit is on. Autocommit makes each statement its
         # own implicitly-committed transaction, so a caught IntegrityError

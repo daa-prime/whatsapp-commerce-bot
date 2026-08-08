@@ -1,8 +1,8 @@
 # db/init_db.py
 """
-Creates the schema (db/schema.sql, SPEC Section 4) and seeds the default
-hospital (db/seed.py). Safe to re-run — every CREATE is IF NOT EXISTS and
-seed_default_hospital() no-ops if that hospital already exists.
+Creates the schema (db/schema.sql, SPEC.md Section 4) and seeds the default
+tenant (db/seed.py). Safe to re-run — every CREATE is IF NOT EXISTS and
+seed_default_tenant() no-ops if that tenant already exists.
 
 Run directly to set up (or update) the on-disk database:
     python -m db.init_db
@@ -24,19 +24,19 @@ def init_db_on_connection(conn) -> int:
     tests (against an in-memory DB) and internally by init_db() below."""
     schema_sql = _SCHEMA_PATH.read_text(encoding="utf-8")
     conn.executescript(schema_sql)
-    hospital_name = os.environ.get("HOSPITAL_NAME", "Default Hospital")
+    tenant_name = os.environ.get("TENANT_NAME", "Default Tenant")
     phone_number_id = os.environ.get("WHATSAPP_PHONE_NUMBER_ID")
-    # Populating these from .env keeps the one real hospital's row usable for
-    # per-message routing (SPEC Section 12.2/Phase 9) without requiring a manual
-    # DB edit — core/main.py no longer reads WHATSAPP_ACCESS_TOKEN directly.
+    # Populating these from .env keeps the one real tenant's row usable for
+    # per-message routing without requiring a manual DB edit — core/main.py no
+    # longer reads WHATSAPP_ACCESS_TOKEN directly.
     access_token = os.environ.get("WHATSAPP_ACCESS_TOKEN")
     app_secret = os.environ.get("WHATSAPP_APP_SECRET")
-    hospital_id = seed.seed_default_hospital(
-        conn, hospital_name=hospital_name, whatsapp_phone_number_id=phone_number_id,
+    tenant_id = seed.seed_default_tenant(
+        conn, tenant_name=tenant_name, whatsapp_phone_number_id=phone_number_id,
         access_token=access_token, app_secret=app_secret,
     )
     conn.commit()
-    return hospital_id
+    return tenant_id
 
 
 def init_db() -> int:
@@ -46,7 +46,7 @@ def init_db() -> int:
     shared connection (rather than opening + closing its own) so init_db() and
     every db/repository.py call afterward operate against the exact same
     connection object.
-    Returns the seeded hospital's id.
+    Returns the seeded tenant's id.
     """
     conn = get_connection()
     return init_db_on_connection(conn)
@@ -60,5 +60,5 @@ def _redact_credentials(database_url: str) -> str:
 
 
 if __name__ == "__main__":
-    seeded_hospital_id = init_db()
-    print(f"Database initialized at {_redact_credentials(get_database_url())} (hospital_id={seeded_hospital_id})")
+    seeded_tenant_id = init_db()
+    print(f"Database initialized at {_redact_credentials(get_database_url())} (tenant_id={seeded_tenant_id})")

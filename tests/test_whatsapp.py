@@ -34,7 +34,7 @@ async def test_client_send_calls_api(httpx_mock):
 async def test_send_list_builds_interactive_list_payload(httpx_mock):
     httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "msg_id"}]})
     client = WhatsAppClient(phone_number_id="123", access_token="token")
-    sections = [{"title": "Departments", "rows": [{"id": "cardiology", "title": "Cardiology"}]}]
+    sections = [{"title": "Products", "rows": [{"id": "sku_1", "title": "Widget"}]}]
     await client.send_list(to="54911111111", body_text="Pick one", button_text="View", sections=sections)
 
     request = httpx_mock.get_requests()[0]
@@ -71,10 +71,10 @@ def test_parse_incoming_message_text():
 def test_parse_incoming_message_list_reply():
     message = {
         "type": "interactive",
-        "interactive": {"type": "list_reply", "list_reply": {"id": "cardiology", "title": "Cardiology"}},
+        "interactive": {"type": "list_reply", "list_reply": {"id": "sku_1", "title": "Widget"}},
     }
     assert parse_incoming_message(message) == {
-        "type": "interactive_reply", "id": "cardiology", "title": "Cardiology",
+        "type": "interactive_reply", "id": "sku_1", "title": "Widget",
     }
 
 
@@ -111,7 +111,7 @@ async def test_send_list_does_not_raise_on_5xx(httpx_mock):
     httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", status_code=503)
     client = WhatsAppClient(phone_number_id="123", access_token="token")
     await client.send_list(to="54911111111", body_text="Pick one", button_text="View",
-                            sections=[{"title": "Departments", "rows": [{"id": "cardiology", "title": "Cardiology"}]}])
+                            sections=[{"title": "Products", "rows": [{"id": "sku_1", "title": "Widget"}]}])
 
 
 @pytest.mark.asyncio
