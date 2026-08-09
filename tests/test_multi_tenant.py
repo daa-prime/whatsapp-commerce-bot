@@ -10,14 +10,18 @@ here gets a fresh DB with both the one "real" tenant (whatsapp_phone_number_id
 Phase 0: the hospital product's department/appointment isolation tests are
 gone along with that domain logic. What's left here is the tenant-routing
 plumbing (signature validation, unrecognized/deactivated numbers, per-tenant
-session isolation) that's genuinely reusable infrastructure — plus a
-replacement test for the abandoned-cart-nudges placeholder endpoint that
-succeeded reminders/scheduler.py's old appointment-reminders endpoint.
+session isolation) that's genuinely reusable infrastructure — plus tests for
+the /internal/send-abandoned-cart-nudges endpoint that wires reminders/
+scheduler.py's real logic (SPEC.md Phase 6) in per active tenant. The
+scheduler's own nudge logic (thresholds, idempotency, message content) is
+covered directly in tests/test_reminders.py; these just prove the endpoint
+loops every active tenant with its own credentials.
 """
 import hashlib
 import hmac
 import json
 import os
+from decimal import Decimal
 
 import pytest
 
@@ -182,13 +186,22 @@ def test_tenant_with_no_app_secret_configured_rejects_all_signatures(second_tena
     assert resp.status_code == 403  # rejected cleanly, not a 500
 
 
-# --- Abandoned-cart-nudges placeholder endpoint loops over active tenants ---
+# --- Abandoned-cart-nudges endpoint loops over active tenants ---
 
-def test_abandoned_cart_nudges_endpoint_reports_per_tenant(tenant_id, second_tenant_id):
-    """Phase 0: reminders/scheduler.py's send_abandoned_cart_nudges() is a
-    no-op placeholder (no order/cart model exists until Phase 5), but the
-    /internal/* cron-triggered-endpoint shape itself — looping every active
-    tenant with its own client — must already work end-to-end."""
+def _backdate_order(tenant_id, order_id, hours_ago):
+    import db.connection as db_connection
+    conn = db_connection.get_connection()
+    conn.execute(
+        "UPDATE orders SET created_at = (now() - (? * interval '1 hour'))::text WHERE tenant_id = ? AND id = ?",
+        (hours_ago, tenant_id, order_id),
+    )
+    conn.commit()
+
+
+def test_abandoned_cart_nudges_endpoint_reports_per_tenant_with_nothing_to_nudge(tenant_id, second_tenant_id):
+    """No abandoned orders exist for either tenant, but the /internal/*
+    cron-triggered-endpoint shape itself — looping every active tenant with
+    its own client — must still work end-to-end and report 0 sent."""
     resp = client.post("/internal/send-abandoned-cart-nudges", headers={"X-Internal-Secret": "internalsecret"})
 
     assert resp.status_code == 200
@@ -196,6 +209,35 @@ def test_abandoned_cart_nudges_endpoint_reports_per_tenant(tenant_id, second_ten
     assert body["sent"] == 0
     assert body["by_tenant"]["Default Tenant"] == 0
     assert body["by_tenant"]["Test Tenant 2"] == 0
+
+
+def test_abandoned_cart_nudges_endpoint_sends_real_nudges_per_tenant(tenant_id, second_tenant_id, httpx_mock):
+    """End-to-end: each active tenant's own abandoned orders get nudged with
+    that tenant's own WhatsApp credentials, via the real scheduler logic."""
+    order_a = db.create_order(tenant_id, customer_phone="911111111111", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                               subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, order_a.id, hours_ago=5)
+    order_b = db.create_order(second_tenant_id, customer_phone="922222222222", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                               subtotal=Decimal("50.00"), total=Decimal("50.00"))
+    _backdate_order(second_tenant_id, order_b.id, hours_ago=5)
+
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "a"}]})
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/TEST_TENANT_2_PHONE_ID/messages", json={"messages": [{"id": "b"}]})
+
+    resp = client.post("/internal/send-abandoned-cart-nudges", headers={"X-Internal-Secret": "internalsecret"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["sent"] == 2
+    assert body["by_tenant"]["Default Tenant"] == 1
+    assert body["by_tenant"]["Test Tenant 2"] == 1
+
+    requests = httpx_mock.get_requests()
+    urls = {str(r.url) for r in requests}
+    assert "https://graph.facebook.com/v22.0/123/messages" in urls
+    assert "https://graph.facebook.com/v22.0/TEST_TENANT_2_PHONE_ID/messages" in urls
+    assert db.get_order(tenant_id, order_a.id).nudge_sent_at is not None
+    assert db.get_order(second_tenant_id, order_b.id).nudge_sent_at is not None
 
 
 def test_abandoned_cart_nudges_endpoint_requires_internal_secret():

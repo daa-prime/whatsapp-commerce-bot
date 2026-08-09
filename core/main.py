@@ -277,11 +277,9 @@ async def receive_payment_webhook(request: Request):
 async def trigger_abandoned_cart_nudges(request: Request):
     """Hit by an external cron job — not an in-process scheduler, same pattern
     as this endpoint's predecessor. Loops over every active tenant, sending
-    each one's abandoned-cart nudges with its own credentials.
-
-    Earmarked for SPEC.md Phase 6 — reminders/scheduler.py's
-    send_abandoned_cart_nudges() is a no-op placeholder until the order/cart
-    data model (Phase 5) exists, so this always reports 0 sent for now."""
+    each one's abandoned-cart nudges (reminders/scheduler.py, SPEC.md Phase 6)
+    with its own credentials -- each tenant's own pending_payment orders,
+    its own abandoned_cart_nudge_hours threshold, its own WhatsApp client."""
     secret = request.headers.get("X-Internal-Secret", "")
     if secret != INTERNAL_SECRET:
         raise HTTPException(status_code=403)

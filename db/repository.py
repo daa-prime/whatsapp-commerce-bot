@@ -34,6 +34,7 @@ class Tenant:
     payment_gateway_webhook_secret: str | None  # verifies payments.py's webhook signatures
     welcome_message_text: str | None
     timezone: str
+    abandoned_cart_nudge_hours: int
     is_active: bool
     data_tier: str
     external_api_base_url: str | None
@@ -54,6 +55,7 @@ def _row_to_tenant(row) -> Tenant:
         payment_gateway_webhook_secret=row["payment_gateway_webhook_secret"],
         welcome_message_text=row["welcome_message_text"],
         timezone=row["timezone"],
+        abandoned_cart_nudge_hours=row["abandoned_cart_nudge_hours"],
         is_active=bool(row["is_active"]),
         data_tier=row["data_tier"],
         external_api_base_url=row["external_api_base_url"],
@@ -95,6 +97,7 @@ def create_tenant(
     app_secret: str | None = None,
     welcome_message_text: str | None = None,
     timezone: str = "Asia/Kolkata",
+    abandoned_cart_nudge_hours: int = 2,
     meta_catalog_id: str | None = None,
     payment_gateway_provider: str | None = None,
     payment_gateway_key_id: str | None = None,
@@ -115,6 +118,9 @@ def create_tenant(
     timing logic. Defaults to Asia/Kolkata (Razorpay targets Indian
     businesses, SPEC.md Section 3.3) if the onboarding wizard doesn't override it.
 
+    abandoned_cart_nudge_hours: how long a pending_payment order sits
+    untouched before reminders/scheduler.py nudges the customer. Defaults to 2.
+
     data_tier: "tier1" (default, this product's own database), "tier2"
     (external_api_base_url/external_api_key are only stored here -- no
     connector logic reads them yet), or "tier3" (direct DB connection, not
@@ -122,12 +128,12 @@ def create_tenant(
     conn = get_connection()
     cur = conn.execute(
         "INSERT INTO tenants (name, whatsapp_phone_number_id, meta_access_token_ref, app_secret_ref, "
-        "welcome_message_text, timezone, meta_catalog_id, payment_gateway_provider, payment_gateway_key_id, "
-        "payment_gateway_api_key_ref, payment_gateway_webhook_secret, "
+        "welcome_message_text, timezone, abandoned_cart_nudge_hours, meta_catalog_id, payment_gateway_provider, "
+        "payment_gateway_key_id, payment_gateway_api_key_ref, payment_gateway_webhook_secret, "
         "data_tier, external_api_base_url, external_api_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         (name, whatsapp_phone_number_id, access_token, app_secret, welcome_message_text, timezone,
-         meta_catalog_id, payment_gateway_provider, payment_gateway_key_id,
+         abandoned_cart_nudge_hours, meta_catalog_id, payment_gateway_provider, payment_gateway_key_id,
          payment_gateway_api_key_ref, payment_gateway_webhook_secret,
          data_tier, external_api_base_url, external_api_key),
     )
@@ -143,11 +149,15 @@ def update_tenant_catalog_and_payment(
     payment_gateway_key_id: str | None = None,
     payment_gateway_api_key_ref: str | None = None,
     payment_gateway_webhook_secret: str | None = None,
+    abandoned_cart_nudge_hours: int | None = None,
 ) -> None:
     """Onboarding wizard's catalog/payment-gateway edit step (SPEC.md Section
     7, Phase 7) -- Phase 3's real Razorpay integration (payments.py) reads
     payment_gateway_key_id/payment_gateway_api_key_ref (key_secret) to call
     the API and payment_gateway_webhook_secret to verify webhook signatures.
+    abandoned_cart_nudge_hours (Phase 6, reminders/scheduler.py) lives on this
+    same edit step rather than a separate page -- it's the only other
+    per-tenant "settings that aren't needed at initial onboarding" field so far.
 
     Each field is only overwritten when a caller actually passes a value --
     COALESCE keeps whatever was already stored otherwise (same convention as
@@ -161,10 +171,12 @@ def update_tenant_catalog_and_payment(
         "payment_gateway_provider = COALESCE(?, payment_gateway_provider), "
         "payment_gateway_key_id = COALESCE(?, payment_gateway_key_id), "
         "payment_gateway_api_key_ref = COALESCE(?, payment_gateway_api_key_ref), "
-        "payment_gateway_webhook_secret = COALESCE(?, payment_gateway_webhook_secret) "
+        "payment_gateway_webhook_secret = COALESCE(?, payment_gateway_webhook_secret), "
+        "abandoned_cart_nudge_hours = COALESCE(?, abandoned_cart_nudge_hours) "
         "WHERE id = ?",
         (meta_catalog_id, payment_gateway_provider, payment_gateway_key_id,
-         payment_gateway_api_key_ref, payment_gateway_webhook_secret, tenant_id),
+         payment_gateway_api_key_ref, payment_gateway_webhook_secret,
+         abandoned_cart_nudge_hours, tenant_id),
     )
     conn.commit()
 
@@ -282,6 +294,7 @@ class Order:
     total: Decimal | None
     created_at: str
     paid_at: str | None
+    nudge_sent_at: str | None
 
 
 def _row_to_order(row) -> Order:
@@ -296,6 +309,7 @@ def _row_to_order(row) -> Order:
         total=row["total"],
         created_at=row["created_at"],
         paid_at=row["paid_at"],
+        nudge_sent_at=row["nudge_sent_at"],
     )
 
 
@@ -565,6 +579,54 @@ def mark_order_failed(tenant_id: int, order_id: int) -> bool:
     cur = conn.execute(
         "UPDATE orders SET status = ? WHERE tenant_id = ? AND id = ? AND status NOT IN (?, ?)",
         (ORDER_STATUS_FAILED, tenant_id, order_id, ORDER_STATUS_PAID, ORDER_STATUS_FAILED),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_abandoned_orders(tenant_id: int, older_than_hours: float) -> list[Order]:
+    """Pending-payment orders old enough to nudge (SPEC.md Phase 6's
+    abandoned-cart recovery, reminders/scheduler.py) that haven't already
+    received one -- nudge_sent_at IS NULL is the "not yet nudged" filter,
+    oldest first so a backlog gets worked through in order.
+
+    older_than_hours is compared against created_at directly in SQL (cast to
+    timestamptz), not by computing a cutoff in Python and comparing as TEXT:
+    created_at is always DB-generated (`now()::text`, Postgres's
+    space-separated text output, e.g. "2026-08-09 08:44:12.08121+00"), which
+    would sort incorrectly against a Python-computed ISO-8601 'T'-separated
+    cutoff string under plain lexical TEXT comparison -- ' ' (0x20) sorts
+    before 'T' (0x54) regardless of the actual time each string represents.
+    Casting and comparing as timestamptz sidesteps the format mismatch
+    entirely."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM orders WHERE tenant_id = ? AND status = ? AND nudge_sent_at IS NULL "
+        "AND created_at::timestamptz <= now() - (? * interval '1 hour') "
+        "ORDER BY created_at ASC",
+        (tenant_id, ORDER_STATUS_PENDING_PAYMENT, older_than_hours),
+    ).fetchall()
+    return [_row_to_order(r) for r in rows]
+
+
+def mark_nudge_sent(tenant_id: int, order_id: int) -> bool:
+    """Atomically claims the right to nudge this order -- `WHERE
+    nudge_sent_at IS NULL` means a duplicate/overlapping run of
+    reminders/scheduler.py's job (e.g. two cron ticks close together) can
+    never both send a nudge for the same order, same conditional-UPDATE
+    idempotency technique as mark_order_paid/mark_order_failed.
+
+    Returns True only if THIS call made the claim -- callers
+    (reminders/scheduler.py) send the WhatsApp nudge only if this returns
+    True, and skip it entirely otherwise, same "atomic claim before acting"
+    order core/commerce_flow.py's handle_payment_success already
+    established (not "send first, mark after" -- marking only after an
+    irreversible send can't actually prevent a double-send under a
+    concurrent/duplicate run, only avoid double-counting it)."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE orders SET nudge_sent_at = now()::text WHERE tenant_id = ? AND id = ? AND nudge_sent_at IS NULL",
+        (tenant_id, order_id),
     )
     conn.commit()
     return cur.rowcount > 0

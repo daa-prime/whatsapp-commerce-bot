@@ -140,6 +140,13 @@ def _form_html(errors: list[str] | None = None, values: dict | None = None) -> s
       Leave blank to default to Asia/Kolkata.
     </p>
 
+    <label>Abandoned cart nudge (hours)</label>
+    <input type="text" name="abandoned_cart_nudge_hours" value="{esc('abandoned_cart_nudge_hours')}" placeholder="2">
+    <p class="hint">
+      How long an order sits at "pending payment" before we remind the customer.
+      Leave blank to default to 2 hours.
+    </p>
+
     <fieldset>
       <legend>Data connection</legend>
       <label class="radio-row"><input type="radio" name="data_tier" value="tier1" {checked('data_tier', 'tier1', 'tier1')}>
@@ -248,6 +255,7 @@ async def onboard_tenant_submit(
     app_secret: str = Form(""),
     welcome_message_text: str = Form(""),
     timezone: str = Form(""),
+    abandoned_cart_nudge_hours: str = Form(""),
     data_tier: str = Form("tier1"),
     api_base_url: str = Form(""),
     api_key: str = Form(""),
@@ -265,6 +273,7 @@ async def onboard_tenant_submit(
         "app_secret": app_secret,
         "welcome_message_text": welcome_message_text,
         "timezone": timezone,
+        "abandoned_cart_nudge_hours": abandoned_cart_nudge_hours,
         "data_tier": data_tier,
         "api_base_url": api_base_url,
         "api_key": api_key,
@@ -294,6 +303,15 @@ async def onboard_tenant_submit(
     if payment_gateway_provider and payment_gateway_provider not in _VALID_PAYMENT_PROVIDERS:
         errors.append(f'Unrecognized payment gateway provider "{payment_gateway_provider}".')
 
+    nudge_hours = 2
+    if abandoned_cart_nudge_hours.strip():
+        try:
+            nudge_hours = int(abandoned_cart_nudge_hours.strip())
+            if nudge_hours <= 0:
+                raise ValueError
+        except ValueError:
+            errors.append('Abandoned cart nudge (hours) must be a positive whole number.')
+
     if errors:
         return HTMLResponse(_form_html(errors, values), status_code=400)
 
@@ -310,6 +328,7 @@ async def onboard_tenant_submit(
             app_secret=app_secret.strip() or None,
             welcome_message_text=welcome_message_text.strip() or None,
             timezone=timezone.strip() or "Asia/Kolkata",
+            abandoned_cart_nudge_hours=nudge_hours,
             data_tier=data_tier,
             external_api_base_url=stored_api_base_url,
             external_api_key=stored_api_key,
@@ -392,6 +411,12 @@ def _catalog_payment_form_html(tenant, errors: list[str] | None = None, values: 
     <p class="hint">Currently: {webhook_secret_current}. Leave blank to keep the current value —
       leave blank if you haven't set this up yet — you can add it later.</p>
 
+    <label>Abandoned cart nudge (hours)</label>
+    <input type="text" name="abandoned_cart_nudge_hours" value="{esc('abandoned_cart_nudge_hours')}"
+           placeholder="Currently: {tenant.abandoned_cart_nudge_hours}">
+    <p class="hint">Currently: {tenant.abandoned_cart_nudge_hours} hour{'s' if tenant.abandoned_cart_nudge_hours != 1 else ''}.
+      Leave blank to keep it as-is.</p>
+
     <button type="submit">Save</button>
   </form>
 </body>
@@ -411,7 +436,8 @@ def _catalog_payment_confirmation_html(tenant) -> str:
     Payment gateway provider: {html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "<em>not set</em>"}<br>
     Razorpay Key ID: {html.escape(tenant.payment_gateway_key_id) if tenant.payment_gateway_key_id else "<em>not set</em>"}<br>
     Razorpay Key Secret: {"<em>set</em>" if tenant.payment_gateway_api_key_ref else "<em>not set</em>"}<br>
-    Razorpay Webhook Secret: {"<em>set</em>" if tenant.payment_gateway_webhook_secret else "<em>not set</em>"}
+    Razorpay Webhook Secret: {"<em>set</em>" if tenant.payment_gateway_webhook_secret else "<em>not set</em>"}<br>
+    Abandoned cart nudge: {tenant.abandoned_cart_nudge_hours} hour{'s' if tenant.abandoned_cart_nudge_hours != 1 else ''}
   </p>
   <p><a href="/admin/tenant/{tenant.id}/catalog-payment">Edit again</a></p>
 </body>
@@ -435,6 +461,7 @@ async def edit_tenant_catalog_payment_submit(
     payment_gateway_key_id: str = Form(""),
     payment_gateway_api_key_ref: str = Form(""),
     payment_gateway_webhook_secret: str = Form(""),
+    abandoned_cart_nudge_hours: str = Form(""),
 ):
     tenant = db.get_tenant(tenant_id)
     if tenant is None:
@@ -447,6 +474,7 @@ async def edit_tenant_catalog_payment_submit(
         "payment_gateway_key_id": payment_gateway_key_id,
         "payment_gateway_api_key_ref": payment_gateway_api_key_ref,
         "payment_gateway_webhook_secret": payment_gateway_webhook_secret,
+        "abandoned_cart_nudge_hours": abandoned_cart_nudge_hours,
     }
 
     if admin_secret != ADMIN_SECRET:
@@ -460,6 +488,20 @@ async def edit_tenant_catalog_payment_submit(
             status_code=400,
         )
 
+    nudge_hours = None
+    if abandoned_cart_nudge_hours.strip():
+        try:
+            nudge_hours = int(abandoned_cart_nudge_hours.strip())
+            if nudge_hours <= 0:
+                raise ValueError
+        except ValueError:
+            return HTMLResponse(
+                _catalog_payment_form_html(
+                    tenant, ['Abandoned cart nudge (hours) must be a positive whole number.'], values,
+                ),
+                status_code=400,
+            )
+
     db.update_tenant_catalog_and_payment(
         tenant_id,
         meta_catalog_id=meta_catalog_id.strip() or None,
@@ -467,6 +509,7 @@ async def edit_tenant_catalog_payment_submit(
         payment_gateway_key_id=payment_gateway_key_id.strip() or None,
         payment_gateway_api_key_ref=payment_gateway_api_key_ref.strip() or None,
         payment_gateway_webhook_secret=payment_gateway_webhook_secret.strip() or None,
+        abandoned_cart_nudge_hours=nudge_hours,
     )
 
     return _catalog_payment_confirmation_html(db.get_tenant(tenant_id))

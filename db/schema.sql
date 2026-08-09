@@ -61,17 +61,23 @@ CREATE TABLE IF NOT EXISTS tenants (
     data_tier TEXT NOT NULL DEFAULT 'tier1' CHECK (data_tier IN ('tier1', 'tier2', 'tier3')),
     external_api_base_url TEXT,
     external_api_key TEXT,
+    -- How long a pending_payment order sits untouched (SPEC.md Phase 6)
+    -- before reminders/scheduler.py nudges the customer. Editable per-tenant
+    -- via the onboarding/catalog-payment edit form; defaults to 2 hours.
+    abandoned_cart_nudge_hours INTEGER NOT NULL DEFAULT 2,
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (now()::text)
 );
 
--- payment_gateway_key_id/payment_gateway_webhook_secret were added after
--- tenants already had committed history -- CREATE TABLE IF NOT EXISTS above
--- won't retroactively add columns to an already-existing table, so these use
--- Postgres's ADD COLUMN IF NOT EXISTS instead, same idempotent-migration
--- goal for a database that already ran an earlier version of this file.
+-- payment_gateway_key_id/payment_gateway_webhook_secret/abandoned_cart_nudge_hours
+-- were added after tenants already had committed history -- CREATE TABLE IF
+-- NOT EXISTS above won't retroactively add columns to an already-existing
+-- table, so these use Postgres's ADD COLUMN IF NOT EXISTS instead, same
+-- idempotent-migration goal for a database that already ran an earlier
+-- version of this file.
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_key_id TEXT;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_webhook_secret TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS abandoned_cart_nudge_hours INTEGER NOT NULL DEFAULT 2;
 
 -- Present per SPEC.md Section 4's schema, but not wired up yet -- core/history.py's
 -- Redis/in-memory session store (get_session_store()) is the actual mechanism
@@ -130,6 +136,16 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at TEXT NOT NULL DEFAULT (now()::text),
     paid_at TEXT
 );
+
+-- nudge_sent_at was added after orders already had committed history, same
+-- reason tenants' ADD COLUMN IF NOT EXISTS statements above exist -- a single
+-- timestamp is enough here (SPEC.md Phase 6's abandoned-cart recovery sends
+-- one nudge per order, not the hospital product's multiple-offsets
+-- appointment_reminders pattern; flagged as worth adding later if a two-stage
+-- nudge is ever wanted, not built now). NULL means "not yet nudged" -- the
+-- filter db.get_abandoned_orders() and the idempotency guard
+-- db.mark_nudge_sent() both key off.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS nudge_sent_at TEXT;
 
 -- tenant_id is included directly here (not just reachable via order_id ->
 -- orders.tenant_id) for the same reason the hospital schema's

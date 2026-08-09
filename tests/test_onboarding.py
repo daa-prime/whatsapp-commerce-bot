@@ -335,3 +335,69 @@ def test_catalog_payment_edit_isolated_across_tenants(tenant_id, second_tenant_i
     assert mine.payment_gateway_api_key_ref == "tenant-a-key"
     assert theirs.meta_catalog_id == "tenant-b-catalog"
     assert theirs.payment_gateway_api_key_ref == "tenant-b-key"
+
+
+# --- Abandoned cart nudge hours (SPEC.md Phase 6) ---
+
+def test_abandoned_cart_nudge_hours_defaults_to_two_at_create(tenant_id):
+    resp = client.post("/admin/onboard-tenant", data=VALID_FORM)  # VALID_FORM leaves it blank
+    assert resp.status_code == 200
+
+    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
+    assert tenant.abandoned_cart_nudge_hours == 2
+
+
+def test_abandoned_cart_nudge_hours_can_be_set_at_create(tenant_id):
+    form = dict(VALID_FORM, abandoned_cart_nudge_hours="6")
+    resp = client.post("/admin/onboard-tenant", data=form)
+    assert resp.status_code == 200
+
+    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
+    assert tenant.abandoned_cart_nudge_hours == 6
+
+
+def test_abandoned_cart_nudge_hours_invalid_value_rejected_at_create(tenant_id):
+    form = dict(VALID_FORM, abandoned_cart_nudge_hours="not-a-number")
+    resp = client.post("/admin/onboard-tenant", data=form)
+    assert resp.status_code == 400
+    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
+
+
+def test_abandoned_cart_nudge_hours_zero_rejected_at_create(tenant_id):
+    form = dict(VALID_FORM, abandoned_cart_nudge_hours="0")
+    resp = client.post("/admin/onboard-tenant", data=form)
+    assert resp.status_code == 400
+    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
+
+
+def test_abandoned_cart_nudge_hours_editable_via_catalog_payment_form(tenant_id):
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "abandoned_cart_nudge_hours": "8",
+    })
+    assert resp.status_code == 200
+    assert db.get_tenant(tenant_id).abandoned_cart_nudge_hours == 8
+
+
+def test_abandoned_cart_nudge_hours_blank_keeps_current_value_on_edit(tenant_id):
+    client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "abandoned_cart_nudge_hours": "8",
+    })
+
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "some-catalog-id",  # only updating this field this time
+    })
+
+    assert resp.status_code == 200
+    assert db.get_tenant(tenant_id).abandoned_cart_nudge_hours == 8  # preserved, not reset to blank/default
+
+
+def test_abandoned_cart_nudge_hours_invalid_value_rejected_on_edit(tenant_id):
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "abandoned_cart_nudge_hours": "-3",
+    })
+    assert resp.status_code == 400
+    assert db.get_tenant(tenant_id).abandoned_cart_nudge_hours == 2  # untouched, still the default

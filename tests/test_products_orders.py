@@ -336,3 +336,79 @@ def test_concurrent_checkouts_for_last_unit_exactly_one_succeeds(tenant_id):
     items = db.get_order_items(tenant_id, winner_order.id)
     assert len(items) == 1
     assert items[0].quantity == 1
+
+
+# --- get_abandoned_orders / mark_nudge_sent (SPEC.md Phase 6, abandoned-cart recovery) ---
+
+def _backdate_order(tenant_id, order_id, hours_ago):
+    """Test-only: orders.created_at is always DB-generated (now()::text) --
+    there's no create_order() param for it, so backdating for
+    "genuinely old" test cases goes straight through the connection, same as
+    other tests here already do for fields with no repository setter
+    (e.g. test_get_active_products_excludes_inactive's raw UPDATE)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE orders SET created_at = (now() - (? * interval '1 hour'))::text WHERE tenant_id = ? AND id = ?",
+        (hours_ago, tenant_id, order_id),
+    )
+    conn.commit()
+
+
+def test_get_abandoned_orders_finds_old_pending_payment_orders(tenant_id):
+    order = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, order.id, hours_ago=3)
+
+    abandoned = db.get_abandoned_orders(tenant_id, older_than_hours=2)
+
+    assert [o.id for o in abandoned] == [order.id]
+
+
+def test_get_abandoned_orders_excludes_recent_orders(tenant_id):
+    order = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, order.id, hours_ago=1)  # younger than the 2h threshold
+
+    assert db.get_abandoned_orders(tenant_id, older_than_hours=2) == []
+
+
+def test_get_abandoned_orders_excludes_non_pending_payment_orders(tenant_id):
+    paid = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PAID,
+                            subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, paid.id, hours_ago=5)
+
+    assert db.get_abandoned_orders(tenant_id, older_than_hours=2) == []
+
+
+def test_get_abandoned_orders_excludes_already_nudged_orders(tenant_id):
+    order = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, order.id, hours_ago=5)
+    db.mark_nudge_sent(tenant_id, order.id)
+
+    assert db.get_abandoned_orders(tenant_id, older_than_hours=2) == []
+
+
+def test_get_abandoned_orders_scoped_to_tenant(tenant_id, second_tenant_id):
+    mine = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                            subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(tenant_id, mine.id, hours_ago=5)
+    theirs = db.create_order(second_tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                              subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    _backdate_order(second_tenant_id, theirs.id, hours_ago=5)
+
+    abandoned = db.get_abandoned_orders(tenant_id, older_than_hours=2)
+
+    assert [o.id for o in abandoned] == [mine.id]
+
+
+def test_mark_nudge_sent_is_idempotent(tenant_id):
+    order = db.create_order(tenant_id, customer_phone="919999999999", status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+
+    first = db.mark_nudge_sent(tenant_id, order.id)
+    second = db.mark_nudge_sent(tenant_id, order.id)
+
+    assert first is True
+    assert second is False  # already claimed -- no double nudge
+    assert db.get_order(tenant_id, order.id).nudge_sent_at is not None
