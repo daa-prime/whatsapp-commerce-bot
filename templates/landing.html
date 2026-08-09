@@ -6,6 +6,11 @@
 <style>
   .page { max-width: 1080px; }
 
+  /* base.html always renders its own generic brand header before the
+     page content block -- this page builds a richer one (icon + tagline)
+     below, so the generic one is hidden here rather than shown twice. */
+  .page > .brand { display: none; }
+
   .landing-header { display: flex; align-items: center; margin-bottom: var(--space-8); }
   .landing-header .brand { margin-bottom: 0; }
   .landing-mark {
