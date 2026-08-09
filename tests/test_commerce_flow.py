@@ -6,11 +6,12 @@ tests/test_booking_flow.py used for core/booking_flow.py), not through the
 HTTP webhook — that plumbing is covered separately in tests/test_main.py.
 """
 from decimal import Decimal
+from unittest.mock import patch
 
 import pytest
 
 import db.repository as db
-from core.commerce_flow import MAX_LIST_ROWS, handle_incoming
+from core.commerce_flow import MAX_LIST_ROWS, handle_incoming, handle_payment_failure, handle_payment_success
 from core.history import InMemorySessionStore
 
 PHONE = "919999999999"
@@ -47,6 +48,16 @@ def _make_product(tenant_id, name="Widget", price="199.00", stock_quantity=100, 
     # (create_product's own stock_quantity default is 0) don't trip the
     # add-to-cart stock check added by the hardening pass.
     return db.create_product(tenant_id, name=name, price=Decimal(price), stock_quantity=stock_quantity, **kwargs)
+
+
+def _configure_razorpay(tenant_id):
+    db.update_tenant_catalog_and_payment(
+        tenant_id,
+        payment_gateway_provider="razorpay",
+        payment_gateway_key_id="rzp_test_key",
+        payment_gateway_api_key_ref="rzp_test_secret",
+        payment_gateway_webhook_secret="whsec_test",
+    )
 
 
 @pytest.fixture
@@ -429,4 +440,147 @@ async def test_checkout_all_items_unavailable_shows_apology_and_creates_no_order
         "text",
         {"to": PHONE, "text": "Sorry, the items in your cart are no longer available. Please start shopping again."},
     )
-    assert db.get_orders_for_phone(tenant_id, PHONE) == []
+
+
+# --- Payment link generation at checkout (SPEC.md Section 3.3, Phase 3) ---
+
+@pytest.mark.asyncio
+async def test_checkout_generates_payment_link_when_tenant_configured(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="199.00")
+    _configure_razorpay(tenant_id)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    with patch("payments.create_payment_link", return_value=("https://rzp.io/l/xyz", "plink_xyz")):
+        await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    confirm_text = wa.sent[-1][1]["text"]
+    assert "https://rzp.io/l/xyz" in confirm_text
+    assert "Payment integration coming next" not in confirm_text
+
+    order = db.get_orders_for_phone(tenant_id, PHONE)[0]
+    assert order.payment_link_url == "https://rzp.io/l/xyz"
+    assert order.payment_gateway_reference == "plink_xyz"
+
+
+@pytest.mark.asyncio
+async def test_checkout_falls_back_to_placeholder_when_gateway_not_configured(wa, sessions, tenant_id):
+    """The seeded tenant has no Razorpay credentials -- checkout must still
+    succeed, just without a real payment link."""
+    widget = _make_product(tenant_id, name="Widget", price="199.00")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    assert "Payment integration coming next" in wa.sent[-1][1]["text"]
+    order = db.get_orders_for_phone(tenant_id, PHONE)[0]
+    assert order.payment_link_url is None
+
+
+@pytest.mark.asyncio
+async def test_checkout_handles_razorpay_api_failure_gracefully(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="199.00")
+    _configure_razorpay(tenant_id)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    with patch("payments.create_payment_link", side_effect=RuntimeError("network error")):
+        await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    # The order still exists (checkout itself succeeded) -- only the payment
+    # link generation failed, and the webhook handler must not crash.
+    assert "couldn't generate a payment link" in wa.sent[-1][1]["text"].lower()
+    assert len(db.get_orders_for_phone(tenant_id, PHONE)) == 1
+
+
+# --- Payment webhook handlers (SPEC.md Section 3.3, Phase 3) ---
+
+@pytest.mark.asyncio
+async def test_handle_payment_success_marks_paid_and_sends_confirmation(wa, tenant_id):
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+
+    await handle_payment_success(wa, tenant_id, order.id, "pay_abc123")
+
+    updated = db.get_order(tenant_id, order.id)
+    assert updated.status == db.ORDER_STATUS_PAID
+    assert updated.payment_gateway_reference == "pay_abc123"
+    assert updated.paid_at is not None
+    assert wa.sent[-1] == ("text", {"to": PHONE, "text": f"Payment received! Your order #{order.id} is confirmed."})
+
+
+@pytest.mark.asyncio
+async def test_handle_payment_success_idempotent_on_duplicate_delivery(wa, tenant_id):
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+
+    await handle_payment_success(wa, tenant_id, order.id, "pay_abc123")
+    wa.sent.clear()
+    await handle_payment_success(wa, tenant_id, order.id, "pay_abc123")  # duplicate webhook delivery
+
+    assert wa.sent == []  # no second confirmation
+
+
+@pytest.mark.asyncio
+async def test_handle_payment_failure_link_still_valid_offers_same_link(wa, tenant_id):
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    db.update_order_payment_link(tenant_id, order.id, "https://rzp.io/l/original", "plink_orig")
+    tenant = db.get_tenant(tenant_id)
+
+    await handle_payment_failure(wa, tenant, order.id, link_expired=False)
+
+    assert db.get_order(tenant_id, order.id).status == db.ORDER_STATUS_FAILED
+    assert "https://rzp.io/l/original" in wa.sent[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_payment_failure_link_expired_generates_fresh_link(wa, tenant_id):
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    db.update_order_payment_link(tenant_id, order.id, "https://rzp.io/l/original", "plink_orig")
+    tenant = db.get_tenant(tenant_id)
+
+    with patch("payments.create_payment_link", return_value=("https://rzp.io/l/fresh", "plink_fresh")):
+        await handle_payment_failure(wa, tenant, order.id, link_expired=True)
+
+    updated = db.get_order(tenant_id, order.id)
+    assert updated.status == db.ORDER_STATUS_FAILED
+    assert updated.payment_link_url == "https://rzp.io/l/fresh"
+    assert "https://rzp.io/l/fresh" in wa.sent[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_payment_failure_idempotent_on_duplicate_delivery(wa, tenant_id):
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    tenant = db.get_tenant(tenant_id)
+
+    await handle_payment_failure(wa, tenant, order.id, link_expired=False)
+    wa.sent.clear()
+    await handle_payment_failure(wa, tenant, order.id, link_expired=False)  # duplicate delivery
+
+    assert wa.sent == []
+
+
+@pytest.mark.asyncio
+async def test_handle_payment_failure_never_downgrades_an_already_paid_order(wa, tenant_id):
+    """A late/out-of-order failure webhook must never undo a payment a
+    different (already-processed) webhook delivery already confirmed."""
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"))
+    tenant = db.get_tenant(tenant_id)
+    await handle_payment_success(wa, tenant_id, order.id, "pay_abc123")
+    wa.sent.clear()
+
+    await handle_payment_failure(wa, tenant, order.id, link_expired=False)
+
+    assert db.get_order(tenant_id, order.id).status == db.ORDER_STATUS_PAID  # not downgraded
+    assert wa.sent == []

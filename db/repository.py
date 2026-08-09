@@ -29,7 +29,9 @@ class Tenant:
     app_secret: str | None  # DB column: app_secret_ref
     meta_catalog_id: str | None
     payment_gateway_provider: str | None
-    payment_gateway_api_key_ref: str | None
+    payment_gateway_key_id: str | None  # Razorpay key_id (public)
+    payment_gateway_api_key_ref: str | None  # Razorpay key_secret (private)
+    payment_gateway_webhook_secret: str | None  # verifies payments.py's webhook signatures
     welcome_message_text: str | None
     timezone: str
     is_active: bool
@@ -47,7 +49,9 @@ def _row_to_tenant(row) -> Tenant:
         app_secret=row["app_secret_ref"],
         meta_catalog_id=row["meta_catalog_id"],
         payment_gateway_provider=row["payment_gateway_provider"],
+        payment_gateway_key_id=row["payment_gateway_key_id"],
         payment_gateway_api_key_ref=row["payment_gateway_api_key_ref"],
+        payment_gateway_webhook_secret=row["payment_gateway_webhook_secret"],
         welcome_message_text=row["welcome_message_text"],
         timezone=row["timezone"],
         is_active=bool(row["is_active"]),
@@ -93,7 +97,9 @@ def create_tenant(
     timezone: str = "Asia/Kolkata",
     meta_catalog_id: str | None = None,
     payment_gateway_provider: str | None = None,
+    payment_gateway_key_id: str | None = None,
     payment_gateway_api_key_ref: str | None = None,
+    payment_gateway_webhook_secret: str | None = None,
     data_tier: str = "tier1",
     external_api_base_url: str | None = None,
     external_api_key: str | None = None,
@@ -116,11 +122,13 @@ def create_tenant(
     conn = get_connection()
     cur = conn.execute(
         "INSERT INTO tenants (name, whatsapp_phone_number_id, meta_access_token_ref, app_secret_ref, "
-        "welcome_message_text, timezone, meta_catalog_id, payment_gateway_provider, payment_gateway_api_key_ref, "
+        "welcome_message_text, timezone, meta_catalog_id, payment_gateway_provider, payment_gateway_key_id, "
+        "payment_gateway_api_key_ref, payment_gateway_webhook_secret, "
         "data_tier, external_api_base_url, external_api_key) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
         (name, whatsapp_phone_number_id, access_token, app_secret, welcome_message_text, timezone,
-         meta_catalog_id, payment_gateway_provider, payment_gateway_api_key_ref,
+         meta_catalog_id, payment_gateway_provider, payment_gateway_key_id,
+         payment_gateway_api_key_ref, payment_gateway_webhook_secret,
          data_tier, external_api_base_url, external_api_key),
     )
     new_id = cur.fetchone()["id"]
@@ -132,26 +140,31 @@ def update_tenant_catalog_and_payment(
     tenant_id: int,
     meta_catalog_id: str | None = None,
     payment_gateway_provider: str | None = None,
+    payment_gateway_key_id: str | None = None,
     payment_gateway_api_key_ref: str | None = None,
+    payment_gateway_webhook_secret: str | None = None,
 ) -> None:
     """Onboarding wizard's catalog/payment-gateway edit step (SPEC.md Section
-    7, Phase 7) -- no integration logic reads these fields yet, this just
-    captures and stores the data for when Phase 1 (catalog) and Phase 3
-    (payment) are built.
+    7, Phase 7) -- Phase 3's real Razorpay integration (payments.py) reads
+    payment_gateway_key_id/payment_gateway_api_key_ref (key_secret) to call
+    the API and payment_gateway_webhook_secret to verify webhook signatures.
 
     Each field is only overwritten when a caller actually passes a value --
     COALESCE keeps whatever was already stored otherwise (same convention as
     update_order_status), so submitting the edit form with a field left
     blank (e.g. because it isn't set up yet) never clobbers an existing
-    catalog ID or payment key with NULL."""
+    catalog ID or payment credential with NULL."""
     conn = get_connection()
     conn.execute(
         "UPDATE tenants SET "
         "meta_catalog_id = COALESCE(?, meta_catalog_id), "
         "payment_gateway_provider = COALESCE(?, payment_gateway_provider), "
-        "payment_gateway_api_key_ref = COALESCE(?, payment_gateway_api_key_ref) "
+        "payment_gateway_key_id = COALESCE(?, payment_gateway_key_id), "
+        "payment_gateway_api_key_ref = COALESCE(?, payment_gateway_api_key_ref), "
+        "payment_gateway_webhook_secret = COALESCE(?, payment_gateway_webhook_secret) "
         "WHERE id = ?",
-        (meta_catalog_id, payment_gateway_provider, payment_gateway_api_key_ref, tenant_id),
+        (meta_catalog_id, payment_gateway_provider, payment_gateway_key_id,
+         payment_gateway_api_key_ref, payment_gateway_webhook_secret, tenant_id),
     )
     conn.commit()
 
@@ -491,3 +504,67 @@ def checkout_cart(
         "SELECT * FROM orders WHERE tenant_id = ? AND id = ?", (tenant_id, order_id),
     ).fetchone()
     return _row_to_order(row), unavailable
+
+
+def update_order_payment_link(
+    tenant_id: int, order_id: int, payment_link_url: str, payment_gateway_reference: str | None,
+) -> None:
+    """Stores a freshly-created payment link (checkout) or a replacement one
+    (a link-expiry retry, payments.py) -- unlike update_order_status's
+    COALESCE fields, payment_link_url is always overwritten here since a new
+    link genuinely replaces the old one."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE orders SET payment_link_url = ?, "
+        "payment_gateway_reference = COALESCE(?, payment_gateway_reference) "
+        "WHERE tenant_id = ? AND id = ?",
+        (payment_link_url, payment_gateway_reference, tenant_id, order_id),
+    )
+    conn.commit()
+
+
+def mark_order_paid(
+    tenant_id: int, order_id: int, payment_gateway_reference: str | None, paid_at: str,
+) -> bool:
+    """Atomically transitions an order to ORDER_STATUS_PAID -- `WHERE status
+    != 'paid'` means a duplicate/concurrent payment webhook delivery for an
+    order that's already paid is a safe no-op, not a double-transition. This
+    is a single conditional UPDATE, not a separate SELECT-then-UPDATE, for
+    the same reason as checkout_cart()'s stock decrement: two genuinely
+    concurrent webhook deliveries for the same order must not both see
+    "not yet paid" and both act on it.
+
+    Returns True only if THIS call is the one that actually made the
+    transition -- callers (core/commerce_flow.py's handle_payment_success)
+    use that to decide whether to send the "payment received" WhatsApp
+    confirmation, so a duplicate delivery never double-sends it."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE orders SET status = ?, "
+        "payment_gateway_reference = COALESCE(?, payment_gateway_reference), "
+        "paid_at = ? "
+        "WHERE tenant_id = ? AND id = ? AND status != ?",
+        (ORDER_STATUS_PAID, payment_gateway_reference, paid_at, tenant_id, order_id, ORDER_STATUS_PAID),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def mark_order_failed(tenant_id: int, order_id: int) -> bool:
+    """Same atomic-conditional-transition pattern as mark_order_paid, for the
+    failure path. `WHERE status NOT IN ('paid', 'failed')` serves two
+    purposes: it makes a duplicate failure-webhook delivery a no-op (same as
+    mark_order_paid's duplicate protection), and it means a late/out-of-order
+    failure event can never downgrade an order that a *different* webhook
+    delivery already marked paid.
+
+    Returns True only if THIS call made the transition -- callers use that to
+    decide whether to notify the customer / generate a retry link, so a
+    duplicate delivery never re-sends that either."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE orders SET status = ? WHERE tenant_id = ? AND id = ? AND status NOT IN (?, ?)",
+        (ORDER_STATUS_FAILED, tenant_id, order_id, ORDER_STATUS_PAID, ORDER_STATUS_FAILED),
+    )
+    conn.commit()
+    return cur.rowcount > 0

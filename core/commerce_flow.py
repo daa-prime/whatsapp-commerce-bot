@@ -40,6 +40,7 @@ import logging
 from datetime import datetime
 from decimal import Decimal
 
+import payments
 import db.repository as db
 from core.whatsapp import WhatsAppClient
 
@@ -511,9 +512,12 @@ async def _handle_cart(wa: WhatsAppClient, sessions, phone: str, tenant_id: int,
 
 async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict) -> None:
     """Creates a real orders row (ORDER_STATUS_PENDING_PAYMENT) + order_items
-    from the cart, decrementing stock atomically, then stubs the payment step
-    -- SPEC.md Section 3.3's Razorpay payment-link generation is the next
-    build, not done here.
+    from the cart, decrementing stock atomically, then generates a real
+    Razorpay payment link (payments.py) for the order total and sends it as
+    part of the confirmation message -- SPEC.md Section 3.3. A tenant that
+    hasn't configured Razorpay yet (all of Phase 7's payment fields are
+    optional) falls back to the old placeholder message instead of failing
+    checkout outright.
 
     Duplicate-checkout protection: the cart is cleared (sessions.reset) here,
     before the DB write, not after. This composes with two things: (1)
@@ -555,8 +559,115 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
         verb = "was" if len(dropped_names) == 1 else "were"
         message += f"\n\nNote: {', '.join(dropped_names)} went out of stock and {verb} removed from your order."
 
-    message += "\n\nPayment integration coming next — we'll follow up with a payment link shortly."
+    tenant = db.get_tenant(tenant_id)
+    try:
+        payment_url, payment_link_id = payments.create_payment_link(tenant, order)
+    except payments.PaymentGatewayNotConfigured:
+        message += "\n\nPayment integration coming next — we'll follow up with a payment link shortly."
+    except Exception:
+        # A real Razorpay API failure (network issue, bad credentials, etc.)
+        # -- the order still exists and is still payable once the operator
+        # sorts out the gateway issue, so this must not crash the webhook
+        # handler, same "never let a downstream failure break message
+        # acknowledgment" rule as core/whatsapp.py's send methods.
+        logger.exception("Razorpay payment link creation failed for tenant=%s order=%s", tenant_id, order.id)
+        message += "\n\nWe couldn't generate a payment link right now — we'll follow up shortly."
+    else:
+        db.update_order_payment_link(tenant_id, order.id, payment_url, payment_link_id)
+        message += f"\n\nPay here to confirm your order: {payment_url}"
+
     await wa.send_text(phone, message)
+
+
+# --- Payment webhook handlers (SPEC.md Section 3.3, Phase 3) ---
+# Called from core/main.py's POST /webhook/payment route, after it has
+# already resolved the tenant from the payload's reference_id and verified
+# Razorpay's signature against that tenant's own webhook secret -- these
+# functions assume that's already happened and just act on a trusted event.
+# No session/state-machine involvement here (unlike everything above) --
+# payment webhooks aren't part of a customer's live conversation turn, they
+# can arrive minutes or hours after the customer last messaged.
+
+async def handle_payment_success(
+    wa: WhatsAppClient, tenant_id: int, order_id: int, payment_gateway_reference: str | None,
+) -> None:
+    """Marks the order paid and sends the customer a confirmation. Idempotent
+    against duplicate webhook deliveries (Razorpay, like Meta, may redeliver
+    events) via db.mark_order_paid()'s atomic conditional UPDATE -- if this
+    specific call isn't the one that actually transitioned the order (i.e.
+    it was already paid), no second confirmation is sent."""
+    order = db.get_order(tenant_id, order_id)
+    if order is None:
+        logger.warning("Payment success webhook for unknown order tenant_id=%s order_id=%s", tenant_id, order_id)
+        return
+
+    transitioned = db.mark_order_paid(tenant_id, order_id, payment_gateway_reference, datetime.now().isoformat())
+    if not transitioned:
+        logger.info("Duplicate payment-success webhook for already-paid order %s, ignoring", order_id)
+        return
+
+    await wa.send_text(order.customer_phone, f"Payment received! Your order #{order.id} is confirmed.")
+
+
+async def handle_payment_failure(wa: WhatsAppClient, tenant: db.Tenant, order_id: int, link_expired: bool) -> None:
+    """Marks the order failed and offers the customer a way to retry.
+    Idempotent the same way handle_payment_success is, via
+    db.mark_order_failed()'s atomic conditional UPDATE.
+
+    link_expired distinguishes two different Razorpay events (see
+    payments.py's module docstring on payload-shape uncertainty): a
+    payment_link.expired event means the link itself is no longer payable,
+    so a fresh one is generated; a plain payment.failed event means one
+    payment *attempt* against a still-open link failed, so the existing link
+    is still valid and is resent as-is."""
+    order = db.get_order(tenant.id, order_id)
+    if order is None:
+        logger.warning("Payment failure webhook for unknown order tenant_id=%s order_id=%s", tenant.id, order_id)
+        return
+
+    transitioned = db.mark_order_failed(tenant.id, order_id)
+    if not transitioned:
+        logger.info("Duplicate/stale payment-failure webhook for order %s (already failed or paid), ignoring", order_id)
+        return
+
+    if not link_expired:
+        if order.payment_link_url:
+            await wa.send_text(
+                order.customer_phone,
+                f"Your payment for order #{order.id} didn't go through. "
+                f"You can try again here: {order.payment_link_url}",
+            )
+        else:
+            await wa.send_text(
+                order.customer_phone,
+                f"Your payment for order #{order.id} didn't go through. Please contact us to complete your order.",
+            )
+        return
+
+    try:
+        new_url, new_link_id = payments.create_payment_link(tenant, order)
+    except payments.PaymentGatewayNotConfigured:
+        # Shouldn't normally happen (a payment link already existed for this
+        # order, so the tenant was configured at checkout time) -- credentials
+        # could have been cleared since. Fail gracefully either way.
+        await wa.send_text(
+            order.customer_phone,
+            f"There was a problem with payment for order #{order.id}. Please contact us to complete your order.",
+        )
+        return
+    except Exception:
+        logger.exception("Razorpay retry-link creation failed for tenant=%s order=%s", tenant.id, order_id)
+        await wa.send_text(
+            order.customer_phone,
+            f"There was a problem generating a new payment link for order #{order.id}. Please contact us to complete your order.",
+        )
+        return
+
+    db.update_order_payment_link(tenant.id, order_id, new_url, new_link_id)
+    await wa.send_text(
+        order.customer_phone,
+        f"Your payment link for order #{order.id} expired. Here's a new one: {new_url}",
+    )
 
 
 async def _handle_order_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:

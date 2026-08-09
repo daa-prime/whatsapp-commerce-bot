@@ -81,3 +81,17 @@ Technical decisions made during development, with rationale.
 **Decision:** `db/connection.py` gained a `transaction()` context manager (autocommit off for its duration, explicit commit/rollback) used by `db.checkout_cart()` alone. Every other repository function keeps using the connection's default per-statement autocommit, completely unaffected.
 
 **Why:** The connection layer has run in autocommit mode since the hospital repo's SQLite-to-Postgres migration — every existing repository function already assumes each statement is its own transaction (see that migration's own rationale above). Checkout is the first call site that genuinely needs several statements (stock decrement, order insert, order_items inserts) to succeed or fail together — if the process crashed between decrementing stock and creating the order, autocommit would leave stock permanently decremented with no order to show for it. Rather than flipping the whole connection to manual-transaction mode (which would force every other call site to start managing commits explicitly, a much bigger change for one call site's need), `transaction()` is scoped to a `with` block and restores autocommit on exit either way.
+
+## reference_id, not a database lookup, resolves a payment webhook to a tenant
+
+**Decision:** Every Razorpay Payment Link is created with `reference_id = "{tenant_id}:{order_id}"` (`payments.py`'s `_build_reference_id`). `POST /webhook/payment` parses that back out of the incoming payload *before* doing anything else, and that's what determines which tenant's webhook secret to verify the signature against.
+
+**Why:** Meta's webhook payload carries `phone_number_id` — a field Meta itself controls and always includes, which already uniquely identifies the receiving tenant. Razorpay has no equivalent: each tenant has its own separate Razorpay account, and nothing in a generic Razorpay webhook payload says which merchant/tenant it's for beyond content the payment link's *creator* chose to embed. `reference_id` (and a duplicate copy in `notes`, for payload-shape redundancy — see `payments.py`'s module docstring) is that embedded content. This makes tenant resolution a two-phase process, same shape as the Meta webhook: parse the payload structurally (untrusted) to find `reference_id` → look up that tenant → verify the signature with *that* tenant's own webhook secret → only then act. A payload with a missing or malformed `reference_id` can't be resolved to any tenant and is safely ignored.
+
+**Trade-off:** Order ids are per-tenant, not globally unique, so `reference_id` must always carry both halves — `order_id` alone would let tenant B's order collide with tenant A's order of the same number. Tested directly in `tests/test_payment_webhook.py::test_order_id_collision_across_tenants_resolves_to_correct_tenant`.
+
+## Three Razorpay credentials per tenant, not one
+
+**Decision:** `tenants` gained two columns beyond the one Spec.md Section 7 originally anticipated (`payment_gateway_api_key_ref`): `payment_gateway_key_id` (public) and `payment_gateway_webhook_secret` (private, used only for webhook signature verification).
+
+**Why:** Razorpay's API authenticates with a `(key_id, key_secret)` pair, and webhook signature verification uses a *third*, separately-generated secret — none of these three are interchangeable, and a real integration needs all of them. Section 7's env-var list was written before a real Razorpay integration existed to clarify the requirement; discovered and corrected while building `payments.py`.

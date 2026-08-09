@@ -12,9 +12,9 @@ Customers message the business's WhatsApp number, browse a product catalog nativ
 
 ## Status
 
-**A customer can shop and check out today, but only through a manual bot-driven menu, not Meta's native catalog/cart — and there's no payment step yet.** This repo was forked from a working WhatsApp hospital-booking product to reuse its multi-tenant webhook infrastructure. See [Spec.md](Spec.md) Section 0 for the current build-phase status in detail, and Section 5 for the full phase plan.
+**A customer can shop, check out, and pay today — through a manual bot-driven menu, not Meta's native catalog/cart.** This repo was forked from a working WhatsApp hospital-booking product to reuse its multi-tenant webhook infrastructure. See [Spec.md](Spec.md) Section 0 for the current build-phase status in detail, and Section 5 for the full phase plan.
 
-What works right now: a customer messages the bot, taps through Shop Now → browse products → add to cart → view cart → checkout, and a real `pending_payment` order is created in the database. What doesn't exist yet: Meta Commerce Manager catalog integration (so browsing happens via a bot-built list, not WhatsApp's native catalog UI), payment link generation, and invoicing — checkout currently ends at a "Payment integration coming next" placeholder.
+What works right now: a customer messages the bot, taps through Shop Now → browse products → add to cart → view cart → checkout, gets a real Razorpay payment link, and — once they pay — a WhatsApp confirmation with their order automatically marked paid. What doesn't exist yet: Meta Commerce Manager catalog integration (so browsing happens via a bot-built list, not WhatsApp's native catalog UI) and invoicing (a PDF once payment confirms).
 
 ---
 
@@ -27,11 +27,11 @@ What works right now: a customer messages the bot, taps through Shop Now → bro
 | Products/orders/order_items data model + CRUD | ✅ Built |
 | Shop/cart/checkout conversation flow, My Orders, Track Order | ✅ Built (menu-driven bot flow, not Meta's native catalog/cart yet) |
 | Stock checks + race-safe decrement + duplicate-checkout protection | ✅ Hardened — see [DECISIONS.md](DECISIONS.md) |
+| Payment link generation + gateway webhook (Razorpay) | ✅ Built, pending live verification — see Spec.md Section 0's Phase 3 caveat |
+| Onboarding wizard: catalog/payment-gateway setup | ✅ Built (`/admin/onboard-tenant` + `/admin/tenant/{id}/catalog-payment`) |
 | Product catalog (via Meta Commerce Manager) | ❌ Not started — products are entered manually for now |
 | Order-received webhook handling (Meta's native `order` message type) | ❌ Not started — `commerce_flow.py`'s cart is a manual substitute |
-| Payment link generation + gateway webhook (Razorpay) | ❌ Not started — checkout stops at a placeholder message |
 | PDF invoice generation + delivery | ❌ Not started |
-| Onboarding wizard: catalog/payment-gateway setup | ❌ Not started |
 
 ---
 
@@ -58,14 +58,21 @@ Customer sends WhatsApp message
 └─────────┬──────────────┘     Talk to Us placeholders (Spec.md 3)
           │
           ▼
-┌───────────────────────┐
-│  Checkout creates a real│ ◄── orders (pending_payment) + order_items,
-│  order, stops at a      │     then a placeholder message -- Phase 3's
-│  payment placeholder     │     Razorpay integration isn't built yet
-└───────────────────────┘
+┌────────────────────────┐
+│  Checkout creates a real │ ◄── orders (pending_payment) + order_items,
+│  order + Razorpay link,  │     stock decremented atomically, link sent
+│  customer pays           │     to the customer (payments.py)
+└─────────┬────────────────┘
+          │
+          ▼
+┌────────────────────────┐
+│  POST /webhook/payment   │ ◄── Razorpay's callback (separate from the
+│  verifies signature,     │     Meta webhook above) marks the order paid/
+│  marks order paid/failed │     failed and confirms via WhatsApp
+└────────────────────────┘
 ```
 
-This is a temporary substitute for Meta's native catalog/cart (Spec.md Section 2) — once Phase 1's real catalog is linked, browsing should move to WhatsApp's own catalog UI, and this flow's job narrows to handling the resulting `order` webhook plus My Orders/Track Order/checkout.
+The shop/cart step is a temporary substitute for Meta's native catalog/cart (Spec.md Section 2) — once Phase 1's real catalog is linked, browsing should move to WhatsApp's own catalog UI, and `commerce_flow.py`'s job narrows to handling the resulting `order` webhook plus My Orders/Track Order/checkout/payment.
 
 ---
 
@@ -111,9 +118,14 @@ Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 - Callback URL: `https://your-ngrok-url.ngrok.io/webhook`
 - Verify token: same as your `WHATSAPP_VERIFY_TOKEN`
 
+For payments, set the webhook URL in Razorpay Dashboard → Settings → Webhooks (per tenant, since each has its own Razorpay account):
+- URL: `https://your-ngrok-url.ngrok.io/webhook/payment`
+- Active events: `payment_link.paid`, `payment_link.expired`, `payment.failed`
+- Copy the webhook secret Razorpay generates into that tenant's "Razorpay Webhook Secret" field (see below)
+
 ### Onboarding additional tenants
 
-`GET /admin/onboard-tenant` — a plain server-rendered form (protected by `ADMIN_SECRET`) for adding businesses beyond the one seeded from `.env`. Collects tenant identity, Meta credentials, and a data-connection tier (this platform's own database, or a future connector to the business's existing system). Catalog and payment-gateway setup aren't collected here yet — that's Phase 7.
+`GET /admin/onboard-tenant` — a plain server-rendered form (protected by `ADMIN_SECRET`) for adding businesses beyond the one seeded from `.env`. Collects tenant identity, Meta credentials, a data-connection tier, and optional catalog/payment-gateway fields (Meta Catalog ID, Razorpay key ID/key secret/webhook secret). `GET /admin/tenant/{tenant_id}/catalog-payment` lets an operator add or update the catalog/payment fields later without re-onboarding — submitting it with a field left blank keeps that field's current value rather than clearing it.
 
 ---
 
@@ -123,7 +135,7 @@ Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 pytest tests/ -v
 ```
 
-110 tests across 9 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, the products/orders/order_items CRUD layer, the full shop/cart/checkout conversation flow (including cross-tenant isolation and the 10-row list cap), and stock/race-condition hardening — including a genuine two-connection concurrency test (not a sequential simulation) proving two customers racing for the last unit of a product can never both succeed. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
+155 tests across 11 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form (including catalog/payment-gateway fields), the products/orders/order_items CRUD layer, the full shop/cart/checkout conversation flow (including cross-tenant isolation and the 10-row list cap), stock/race-condition hardening (a genuine two-connection concurrency test, not a sequential simulation, proving two customers racing for the last unit of a product can never both succeed), and the Razorpay payment integration (link generation, webhook signature validation, success/failure/expiry handling, duplicate-delivery idempotency, cross-tenant isolation). Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
 
 ---
 
@@ -159,12 +171,13 @@ uvicorn core.main:app --host 0.0.0.0 --port $PORT
 whatsapp-commerce-bot/
 ├── core/
 │   ├── main.py          # FastAPI app, webhook receipt/routing, message locking
-│   ├── commerce_flow.py  # Shop/cart/checkout/orders state machine (menu-driven)
+│   ├── commerce_flow.py  # Shop/cart/checkout/orders + payment-webhook handlers
 │   ├── whatsapp.py       # WhatsApp Cloud API client, signature validation, payload parsing
 │   ├── history.py        # Conversation history + session store (Redis / in-memory)
 │   └── phone.py          # Phone number normalization
+├── payments.py           # Razorpay payment links + webhook signature/payload parsing
 ├── admin/
-│   └── onboarding.py     # Tenant onboarding form (/admin/onboard-tenant)
+│   └── onboarding.py     # Tenant onboarding form + catalog/payment edit step
 ├── db/
 │   ├── connection.py      # Postgres connection layer
 │   ├── schema.sql         # Data model (tenants, products, orders, order_items)
@@ -173,7 +186,7 @@ whatsapp-commerce-bot/
 │   └── seed.py            # Seed data (default tenant, test tenant)
 ├── reminders/
 │   └── scheduler.py       # Abandoned-cart-nudges placeholder (Phase 6, not implemented)
-└── tests/                 # 110 tests
+└── tests/                 # 155 tests
 ```
 
 See [Spec.md](Spec.md) for the full build spec and phase plan, and [DECISIONS.md](DECISIONS.md) for the architectural rationale carried over from the hospital-booking fork.

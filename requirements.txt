@@ -5,6 +5,7 @@ redis==5.0.8
 python-dotenv==1.0.1
 python-multipart==0.0.20
 psycopg2-binary==2.9.10
+razorpay==1.4.2
 pytest==8.3.3
 pytest-asyncio==0.24.0
 pytest-mock==3.14.0

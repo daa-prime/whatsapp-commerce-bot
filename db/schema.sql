@@ -36,7 +36,16 @@ CREATE TABLE IF NOT EXISTS tenants (
     -- wizard extension once catalog/payment-gateway setup exists; NULL until then.
     meta_catalog_id TEXT,
     payment_gateway_provider TEXT,
-    payment_gateway_api_key_ref TEXT,
+    -- Razorpay needs three separate values to actually integrate (SPEC.md
+    -- Section 7 only anticipated one "api_key_ref" per tenant, written before
+    -- a real integration existed to clarify the requirement): key_id (public,
+    -- safe to display), key_secret (private, used to authenticate API calls
+    -- -- stored in the pre-existing payment_gateway_api_key_ref column), and
+    -- a webhook_secret (private, used only to verify payments.py's webhook
+    -- signatures, never sent on outbound API calls). See payments.py.
+    payment_gateway_key_id TEXT,
+    payment_gateway_api_key_ref TEXT,  -- Razorpay key_secret
+    payment_gateway_webhook_secret TEXT,
     welcome_message_text TEXT,
     -- IANA timezone name, used for displaying order/invoice timestamps in the
     -- tenant's local time (SPEC.md Section 3.4) and for Phase 6's abandoned-cart
@@ -55,6 +64,14 @@ CREATE TABLE IF NOT EXISTS tenants (
     is_active INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (now()::text)
 );
+
+-- payment_gateway_key_id/payment_gateway_webhook_secret were added after
+-- tenants already had committed history -- CREATE TABLE IF NOT EXISTS above
+-- won't retroactively add columns to an already-existing table, so these use
+-- Postgres's ADD COLUMN IF NOT EXISTS instead, same idempotent-migration
+-- goal for a database that already ran an earlier version of this file.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_key_id TEXT;
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_webhook_secret TEXT;
 
 -- Present per SPEC.md Section 4's schema, but not wired up yet -- core/history.py's
 -- Redis/in-memory session store (get_session_store()) is the actual mechanism

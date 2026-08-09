@@ -11,9 +11,10 @@ load_dotenv()  # must run before os.environ[...] reads below, or db.init_db()'s 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import PlainTextResponse
 
+import payments
 import db.repository as db
 from admin.onboarding import router as onboarding_router
-from core.commerce_flow import handle_incoming
+from core.commerce_flow import handle_incoming, handle_payment_failure, handle_payment_success
 from core.history import get_history, get_session_store
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
 from db.init_db import init_db
@@ -221,6 +222,55 @@ async def _process_message(wa: WhatsAppClient, tenant: db.Tenant, phone: str, re
     logger.info("Dispatching message from %s (tenant %s): %s", phone, tenant.id, reply)
     HISTORY.add(phone, "user", reply.get("text") or reply.get("title") or f"[{reply.get('type')}]")
     await handle_incoming(wa, SESSIONS, phone, tenant.id, reply, tenant.name)
+
+
+@app.post("/webhook/payment")
+async def receive_payment_webhook(request: Request):
+    """Razorpay's callback (SPEC.md Section 3.3, Phase 3) -- a separate route
+    from /webhook above since this receives Razorpay's payloads, not Meta's,
+    and needs its own signature scheme. Same two-phase pattern as the Meta
+    webhook: resolve which tenant this is for structurally (untrusted) BEFORE
+    verifying anything, then verify the signature with *that* tenant's own
+    webhook secret, then act -- see payments.py's _build_reference_id
+    docstring for why reference_id is what makes step one possible here
+    (Razorpay has no routing field equivalent to Meta's phone_number_id)."""
+    body = await request.body()
+    try:
+        data = json.loads(body)
+    except (ValueError, TypeError):
+        logger.warning("Malformed payment webhook payload, ignoring: %s", body[:500])
+        return Response(status_code=200)
+
+    event = payments.parse_payment_webhook(data)
+    if event.tenant_id is None or event.order_id is None:
+        logger.warning("Payment webhook with missing/unparseable reference_id, ignoring: %s", body[:500])
+        return Response(status_code=200)
+
+    tenant = db.get_tenant(event.tenant_id)
+    if tenant is None or not tenant.payment_gateway_webhook_secret:
+        logger.warning(
+            "Payment webhook for unrecognized tenant_id=%s or no webhook secret configured, ignoring",
+            event.tenant_id,
+        )
+        return Response(status_code=200)
+
+    signature = request.headers.get("X-Razorpay-Signature", "")
+    if not payments.validate_payment_webhook_signature(body, signature, tenant.payment_gateway_webhook_secret):
+        logger.warning("Invalid payment webhook signature for tenant_id=%s", tenant.id)
+        raise HTTPException(status_code=403, detail="Invalid signature")
+
+    wa = _get_whatsapp_client(tenant)
+
+    if event.event_type == payments.EVENT_PAID:
+        await handle_payment_success(wa, tenant.id, event.order_id, event.payment_gateway_reference)
+    elif event.event_type == payments.EVENT_EXPIRED:
+        await handle_payment_failure(wa, tenant, event.order_id, link_expired=True)
+    elif event.event_type == payments.EVENT_FAILED:
+        await handle_payment_failure(wa, tenant, event.order_id, link_expired=False)
+    else:
+        logger.info("Ignoring unrecognized/irrelevant payment webhook event=%s", data.get("event"))
+
+    return Response(status_code=200)
 
 
 @app.post("/internal/send-abandoned-cart-nudges")

@@ -173,10 +173,21 @@ def _form_html(errors: list[str] | None = None, values: dict | None = None) -> s
         <option value="razorpay" {selected('payment_gateway_provider', 'razorpay', 'razorpay')}>Razorpay</option>
       </select>
 
-      <label>Payment gateway API key</label>
+      <label>Razorpay Key ID</label>
+      <input type="text" name="payment_gateway_key_id" value="{esc('payment_gateway_key_id')}" placeholder="rzp_live_...">
+      <p class="hint">From Razorpay Dashboard → Settings → API Keys. Leave blank if you haven't set this up yet — you can add it later.</p>
+
+      <label>Razorpay Key Secret</label>
       <input type="password" name="payment_gateway_api_key_ref" value="{esc('payment_gateway_api_key_ref')}">
-      <p class="hint">Leave blank if you haven't set this up yet — you can add it later.
-        No payment integration runs against this yet; it's just stored for when it does.</p>
+      <p class="hint">Leave blank if you haven't set this up yet — you can add it later.</p>
+
+      <label>Razorpay Webhook Secret</label>
+      <input type="password" name="payment_gateway_webhook_secret" value="{esc('payment_gateway_webhook_secret')}">
+      <p class="hint">From Razorpay Dashboard → Settings → Webhooks, when you add
+        this platform's payment webhook URL. Used only to verify that a payment
+        webhook genuinely came from Razorpay — leave blank if you haven't set this up
+        yet, you can add it later. No payment integration runs against these fields
+        until they're all filled in.</p>
     </fieldset>
 
     <button type="submit">Create tenant</button>
@@ -242,7 +253,9 @@ async def onboard_tenant_submit(
     api_key: str = Form(""),
     meta_catalog_id: str = Form(""),
     payment_gateway_provider: str = Form(""),
+    payment_gateway_key_id: str = Form(""),
     payment_gateway_api_key_ref: str = Form(""),
+    payment_gateway_webhook_secret: str = Form(""),
 ):
     values = {
         "admin_secret": admin_secret,
@@ -257,7 +270,9 @@ async def onboard_tenant_submit(
         "api_key": api_key,
         "meta_catalog_id": meta_catalog_id,
         "payment_gateway_provider": payment_gateway_provider,
+        "payment_gateway_key_id": payment_gateway_key_id,
         "payment_gateway_api_key_ref": payment_gateway_api_key_ref,
+        "payment_gateway_webhook_secret": payment_gateway_webhook_secret,
     }
 
     if admin_secret != ADMIN_SECRET:
@@ -300,7 +315,9 @@ async def onboard_tenant_submit(
             external_api_key=stored_api_key,
             meta_catalog_id=meta_catalog_id.strip() or None,
             payment_gateway_provider=payment_gateway_provider.strip() or None,
+            payment_gateway_key_id=payment_gateway_key_id.strip() or None,
             payment_gateway_api_key_ref=payment_gateway_api_key_ref.strip() or None,
+            payment_gateway_webhook_secret=payment_gateway_webhook_secret.strip() or None,
         )
     except IntegrityError:
         errors.append(
@@ -336,7 +353,9 @@ def _catalog_payment_form_html(tenant, errors: list[str] | None = None, values: 
 
     catalog_current = html.escape(tenant.meta_catalog_id) if tenant.meta_catalog_id else "not set"
     provider_current = html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "not set"
-    key_current = "set" if tenant.payment_gateway_api_key_ref else "not set"
+    key_id_current = html.escape(tenant.payment_gateway_key_id) if tenant.payment_gateway_key_id else "not set"
+    key_secret_current = "set" if tenant.payment_gateway_api_key_ref else "not set"
+    webhook_secret_current = "set" if tenant.payment_gateway_webhook_secret else "not set"
 
     return f"""<!doctype html>
 <html>
@@ -359,9 +378,18 @@ def _catalog_payment_form_html(tenant, errors: list[str] | None = None, values: 
       <option value="razorpay" {selected('payment_gateway_provider', 'razorpay')}>Razorpay</option>
     </select>
 
-    <label>Payment gateway API key</label>
+    <label>Razorpay Key ID</label>
+    <input type="text" name="payment_gateway_key_id" value="{esc('payment_gateway_key_id')}" placeholder="Currently: {key_id_current}">
+    <p class="hint">Currently: {key_id_current}. Leave blank to keep it as-is.</p>
+
+    <label>Razorpay Key Secret</label>
     <input type="password" name="payment_gateway_api_key_ref" value="{esc('payment_gateway_api_key_ref')}">
-    <p class="hint">Currently: {key_current}. Leave blank to keep the current key —
+    <p class="hint">Currently: {key_secret_current}. Leave blank to keep the current key —
+      leave blank if you haven't set this up yet — you can add it later.</p>
+
+    <label>Razorpay Webhook Secret</label>
+    <input type="password" name="payment_gateway_webhook_secret" value="{esc('payment_gateway_webhook_secret')}">
+    <p class="hint">Currently: {webhook_secret_current}. Leave blank to keep the current value —
       leave blank if you haven't set this up yet — you can add it later.</p>
 
     <button type="submit">Save</button>
@@ -381,7 +409,9 @@ def _catalog_payment_confirmation_html(tenant) -> str:
   <p>
     Meta Catalog ID: {html.escape(tenant.meta_catalog_id) if tenant.meta_catalog_id else "<em>not set</em>"}<br>
     Payment gateway provider: {html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "<em>not set</em>"}<br>
-    Payment gateway API key: {"<em>set</em>" if tenant.payment_gateway_api_key_ref else "<em>not set</em>"}
+    Razorpay Key ID: {html.escape(tenant.payment_gateway_key_id) if tenant.payment_gateway_key_id else "<em>not set</em>"}<br>
+    Razorpay Key Secret: {"<em>set</em>" if tenant.payment_gateway_api_key_ref else "<em>not set</em>"}<br>
+    Razorpay Webhook Secret: {"<em>set</em>" if tenant.payment_gateway_webhook_secret else "<em>not set</em>"}
   </p>
   <p><a href="/admin/tenant/{tenant.id}/catalog-payment">Edit again</a></p>
 </body>
@@ -402,7 +432,9 @@ async def edit_tenant_catalog_payment_submit(
     admin_secret: str = Form(""),
     meta_catalog_id: str = Form(""),
     payment_gateway_provider: str = Form(""),
+    payment_gateway_key_id: str = Form(""),
     payment_gateway_api_key_ref: str = Form(""),
+    payment_gateway_webhook_secret: str = Form(""),
 ):
     tenant = db.get_tenant(tenant_id)
     if tenant is None:
@@ -412,7 +444,9 @@ async def edit_tenant_catalog_payment_submit(
         "admin_secret": admin_secret,
         "meta_catalog_id": meta_catalog_id,
         "payment_gateway_provider": payment_gateway_provider,
+        "payment_gateway_key_id": payment_gateway_key_id,
         "payment_gateway_api_key_ref": payment_gateway_api_key_ref,
+        "payment_gateway_webhook_secret": payment_gateway_webhook_secret,
     }
 
     if admin_secret != ADMIN_SECRET:
@@ -430,7 +464,9 @@ async def edit_tenant_catalog_payment_submit(
         tenant_id,
         meta_catalog_id=meta_catalog_id.strip() or None,
         payment_gateway_provider=payment_gateway_provider.strip() or None,
+        payment_gateway_key_id=payment_gateway_key_id.strip() or None,
         payment_gateway_api_key_ref=payment_gateway_api_key_ref.strip() or None,
+        payment_gateway_webhook_secret=payment_gateway_webhook_secret.strip() or None,
     )
 
     return _catalog_payment_confirmation_html(db.get_tenant(tenant_id))
