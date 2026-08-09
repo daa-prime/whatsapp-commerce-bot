@@ -8,6 +8,8 @@ core/main.py yet).
 import threading
 from decimal import Decimal
 
+import pytest
+
 import db.repository as db
 from db.connection import _connect, get_connection, get_database_url
 
@@ -214,6 +216,53 @@ def test_checkout_cart_returns_none_when_every_item_unavailable(tenant_id):
     assert order is None
     assert unavailable == [str(product.id)]
     assert db.get_orders_for_phone(tenant_id, "919999999999") == []
+
+
+def test_checkout_cart_rolls_back_cleanly_on_mid_transaction_failure(tenant_id, monkeypatch):
+    """Forces a real failure *after* the stock decrement has already run but
+    before the transaction commits (simulating e.g. the order_items insert
+    failing for some unrelated reason) -- same class of question that
+    surfaced a real bug in the hospital repo's advisory-lock work: does the
+    transaction actually roll back everything, and is the connection cleanly
+    usable for the very next unrelated query afterward, or does it get left
+    in a poisoned/aborted state?"""
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+
+    conn = get_connection()
+    real_execute = conn.execute
+
+    def failing_execute(sql, params=()):
+        # Stock UPDATE and the orders INSERT are allowed through normally;
+        # only the order_items INSERT (which runs after the stock decrement
+        # has already happened inside the transaction) fails.
+        if "INSERT INTO order_items" in sql:
+            raise RuntimeError("simulated failure mid-transaction")
+        return real_execute(sql, params)
+
+    monkeypatch.setattr(conn, "execute", failing_execute)
+    try:
+        with pytest.raises(RuntimeError, match="simulated failure mid-transaction"):
+            db.checkout_cart(tenant_id, "919999999999", {str(product.id): 2})
+    finally:
+        monkeypatch.setattr(conn, "execute", real_execute)
+
+    # The stock decrement (which ran successfully before the forced failure)
+    # must be rolled back along with everything else -- not left at 3 (5-2).
+    assert db.get_product(tenant_id, product.id).stock_quantity == 5
+
+    # No order or order_items rows were left behind either.
+    assert db.get_orders_for_phone(tenant_id, "919999999999") == []
+
+    # The connection must be cleanly reusable for the very next unrelated
+    # query -- no lingering "current transaction is aborted" state, and
+    # autocommit correctly restored to True by _Transaction.__exit__'s
+    # finally block. Exercise both a plain read and a full new checkout.
+    assert db.get_product(tenant_id, product.id) is not None
+    other_product = db.create_product(tenant_id, name="Gadget", price=Decimal("10.00"), stock_quantity=1)
+    order, unavailable = db.checkout_cart(tenant_id, "919999999999", {str(other_product.id): 1})
+    assert order is not None
+    assert unavailable == []
+    assert db.get_product(tenant_id, other_product.id).stock_quantity == 0
 
 
 def test_checkout_cart_called_twice_with_same_cart_only_fulfills_once(tenant_id):
