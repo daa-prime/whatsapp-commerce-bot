@@ -1,0 +1,47 @@
+{% extends "portal/_base.html" %}
+{% block title %}Order #{{ order.id }} — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<p><a href="/portal/orders" class="btn-link">&larr; Back to orders</a></p>
+<h1>Order #{{ order.id }} <span class="status-badge {{ order.status }}">{{ order.status }}</span></h1>
+
+<div class="card">
+  <div class="review-row"><p class="label">Customer phone</p><p class="value">{{ order.customer_phone }}</p></div>
+  <div class="review-row"><p class="label">Placed</p><p class="value">{{ order.created_at }}</p></div>
+  <div class="review-row"><p class="label">Paid at</p><p class="value">{{ order.paid_at or "not yet paid" }}</p></div>
+  <div class="review-row"><p class="label">Payment method</p><p class="value">{{ order.payment_method or "--" }}</p></div>
+  <div class="review-row"><p class="label">Payment link</p><p class="value">{% if order.payment_link_url %}<a href="{{ order.payment_link_url }}">{{ order.payment_link_url }}</a>{% else %}--{% endif %}</p></div>
+  <div class="review-row"><p class="label">Subtotal</p><p class="value">{% if order.subtotal %}₹{{ "%.2f"|format(order.subtotal) }}{% else %}--{% endif %}</p></div>
+  <div class="review-row"><p class="label">Total</p><p class="value">{% if order.total %}₹{{ "%.2f"|format(order.total) }}{% else %}--{% endif %}</p></div>
+</div>
+
+<div class="card">
+  <h2>Items</h2>
+  {% if line_items %}
+  <table class="data-table">
+    <thead><tr><th>Product</th><th>Qty</th><th>Unit price</th><th>Line total</th></tr></thead>
+    <tbody>
+      {% for item in line_items %}
+      <tr>
+        <td>{{ item.product_name }}</td>
+        <td>{{ item.quantity }}</td>
+        <td>₹{{ "%.2f"|format(item.unit_price) }}</td>
+        <td>₹{{ "%.2f"|format(item.line_total) }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">No line items on this order.</p>
+  {% endif %}
+</div>
+
+{% if can_fulfill %}
+<form method="post" action="/portal/orders/{{ order.id }}/fulfill">
+  <button type="submit" class="btn btn-primary">Mark as fulfilled</button>
+</form>
+{% elif order.status == "fulfilled" %}
+<p class="hint">This order has already been fulfilled.</p>
+{% endif %}
+
+{% endblock %}

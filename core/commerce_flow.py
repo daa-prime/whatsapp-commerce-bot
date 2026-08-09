@@ -590,18 +590,26 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
 
 async def handle_payment_success(
     wa: WhatsAppClient, tenant_id: int, order_id: int, payment_gateway_reference: str | None,
+    payment_method: str | None = None,
 ) -> None:
     """Marks the order paid and sends the customer a confirmation. Idempotent
     against duplicate webhook deliveries (Razorpay, like Meta, may redeliver
     events) via db.mark_order_paid()'s atomic conditional UPDATE -- if this
     specific call isn't the one that actually transitioned the order (i.e.
-    it was already paid), no second confirmation is sent."""
+    it was already paid), no second confirmation is sent.
+
+    payment_method (e.g. "upi"/"card"/"netbanking", from payments.py's
+    webhook parsing) is stored on the order for the merchant portal's
+    dashboard payment-method breakdown -- optional since not every caller
+    (e.g. existing tests) has it."""
     order = db.get_order(tenant_id, order_id)
     if order is None:
         logger.warning("Payment success webhook for unknown order tenant_id=%s order_id=%s", tenant_id, order_id)
         return
 
-    transitioned = db.mark_order_paid(tenant_id, order_id, payment_gateway_reference, datetime.now().isoformat())
+    transitioned = db.mark_order_paid(
+        tenant_id, order_id, payment_gateway_reference, datetime.now().isoformat(), payment_method=payment_method,
+    )
     if not transitioned:
         logger.info("Duplicate payment-success webhook for already-paid order %s, ignoring", order_id)
         return

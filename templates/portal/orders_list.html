@@ -1,0 +1,34 @@
+{% extends "portal/_base.html" %}
+{% block title %}Orders — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<h1>Orders</h1>
+
+<div class="filter-bar">
+  {% for value, label in status_filters %}
+  <a href="/portal/orders{% if value %}?status={{ value }}{% endif %}" class="{{ 'active' if value == current_status else '' }}">{{ label }}</a>
+  {% endfor %}
+</div>
+
+<div class="card">
+  {% if orders %}
+  <table class="data-table">
+    <thead><tr><th>Order</th><th>Customer</th><th>Amount</th><th>Status</th><th>Placed</th></tr></thead>
+    <tbody>
+      {% for o in orders %}
+      <tr>
+        <td><a href="/portal/orders/{{ o.id }}">#{{ o.id }}</a></td>
+        <td>{{ o.customer_phone }}</td>
+        <td>{% if o.total %}₹{{ "%.2f"|format(o.total) }}{% else %}--{% endif %}</td>
+        <td><span class="status-badge {{ o.status }}">{{ o.status }}</span></td>
+        <td>{{ o.created_at }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">No orders{% if current_status %} with this status{% endif %} yet.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

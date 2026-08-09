@@ -1,0 +1,140 @@
+{% extends "base.html" %}
+
+{% block head %}
+<style>
+  /* Portal pages need more room than the 880px onboarding/admin pages --
+     overriding here (not editing base.html) keeps this scoped to the portal. */
+  .page { max-width: 1180px; }
+
+  .portal-shell {
+    display: grid;
+    grid-template-columns: 200px 1fr;
+    gap: var(--space-6);
+    align-items: start;
+  }
+  @media (max-width: 780px) {
+    .portal-shell { grid-template-columns: 1fr; }
+  }
+
+  .portal-nav {
+    position: sticky;
+    top: var(--space-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+  }
+  .portal-nav-tenant {
+    font-weight: 700;
+    font-size: 0.95rem;
+    padding: 0 var(--space-3) var(--space-3);
+    border-bottom: 1px solid var(--color-border);
+    margin-bottom: var(--space-2);
+  }
+  .portal-nav-link {
+    display: block;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-sm);
+    color: var(--color-muted);
+    font-size: 0.9rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .portal-nav-link:hover { background: var(--color-primary-lighter); }
+  .portal-nav-link.active {
+    color: var(--color-ink);
+    background: var(--color-primary-lighter);
+  }
+  .portal-nav-logout { margin-top: var(--space-3); }
+  .portal-nav-logout button {
+    background: none;
+    border: none;
+    color: var(--color-muted);
+    font-weight: 600;
+    font-size: 0.9rem;
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    width: 100%;
+    text-align: left;
+  }
+  .portal-nav-logout button:hover { color: var(--color-error-text); }
+
+  .stat-tiles {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: var(--space-4);
+    margin-bottom: var(--space-5);
+  }
+  .stat-tile { padding: var(--space-4); }
+  .stat-tile .stat-label {
+    color: var(--color-muted);
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+    margin-bottom: var(--space-1);
+  }
+  .stat-tile .stat-value { font-size: 1.5rem; font-weight: 700; }
+  .stat-tile .stat-delta { font-size: 0.82rem; margin-top: var(--space-1); }
+  .stat-delta.up { color: var(--color-success-text); }
+  .stat-delta.down { color: var(--color-error-text); }
+  .stat-delta.flat { color: var(--color-muted); }
+
+  .charts-row {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: var(--space-4);
+    margin-bottom: var(--space-4);
+  }
+  @media (max-width: 780px) {
+    .charts-row { grid-template-columns: 1fr; }
+  }
+
+  .donut-legend { list-style: none; margin: var(--space-3) 0 0; padding: 0; font-size: 0.85rem; }
+  .donut-legend li { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-1); }
+  .donut-legend .swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; }
+
+  .status-badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+  .status-badge.paid, .status-badge.fulfilled { background: var(--color-success-bg); color: var(--color-success-text); }
+  .status-badge.failed, .status-badge.cancelled { background: var(--color-error-bg); color: var(--color-error-text); }
+  .status-badge.pending_payment, .status-badge.browsing { background: var(--color-primary-lighter); color: var(--color-primary-dark); }
+
+  .filter-bar { display: flex; gap: var(--space-2); margin-bottom: var(--space-4); flex-wrap: wrap; }
+  .filter-bar a {
+    padding: 6px 14px;
+    border-radius: 999px;
+    border: 1px solid var(--color-border);
+    color: var(--color-muted);
+    font-size: 0.85rem;
+    font-weight: 600;
+    text-decoration: none;
+  }
+  .filter-bar a.active { background: var(--color-primary); border-color: var(--color-primary); color: #fff; }
+
+  .inline-form { display: inline; }
+</style>
+{% block portal_head %}{% endblock %}
+{% endblock %}
+
+{% block content %}
+<div class="portal-shell">
+  <nav class="portal-nav">
+    <div class="portal-nav-tenant">{{ tenant.name }}</div>
+    <a href="/portal/dashboard" class="portal-nav-link {{ 'active' if active_nav == 'dashboard' else '' }}">Dashboard</a>
+    <a href="/portal/orders" class="portal-nav-link {{ 'active' if active_nav == 'orders' else '' }}">Orders</a>
+    <a href="/portal/products" class="portal-nav-link {{ 'active' if active_nav == 'products' else '' }}">Products</a>
+    <a href="/portal/settings" class="portal-nav-link {{ 'active' if active_nav == 'settings' else '' }}">Settings</a>
+    <form method="post" action="/portal/logout" class="portal-nav-logout">
+      <button type="submit">Log out</button>
+    </form>
+  </nav>
+  <main class="portal-main">
+    {% block portal_content %}{% endblock %}
+  </main>
+</div>
+{% endblock %}

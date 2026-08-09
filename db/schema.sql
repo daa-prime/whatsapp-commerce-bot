@@ -78,6 +78,12 @@ CREATE TABLE IF NOT EXISTS tenants (
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_key_id TEXT;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS payment_gateway_webhook_secret TEXT;
 ALTER TABLE tenants ADD COLUMN IF NOT EXISTS abandoned_cart_nudge_hours INTEGER NOT NULL DEFAULT 2;
+-- The merchant portal's login (portal/session.py) -- separate from
+-- ADMIN_SECRET, which gates platform-admin operations, not a per-tenant
+-- merchant login. NULL until an admin sets/resets it via
+-- admin/onboarding.py's portal-password page; a NULL hash can never match
+-- any submitted password, so login is correctly refused until then.
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS portal_password_hash TEXT;
 
 -- Present per SPEC.md Section 4's schema, but not wired up yet -- core/history.py's
 -- Redis/in-memory session store (get_session_store()) is the actual mechanism
@@ -146,6 +152,13 @@ CREATE TABLE IF NOT EXISTS orders (
 -- filter db.get_abandoned_orders() and the idempotency guard
 -- db.mark_nudge_sent() both key off.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS nudge_sent_at TEXT;
+
+-- Populated from Razorpay's webhook payload (payment.entity.method --
+-- "upi"/"card"/"netbanking"/"wallet"/etc, see payments.py's
+-- _extract_payment_method) once a payment is captured -- NULL for any order
+-- that hasn't been paid yet, or was paid before this column existed. Used
+-- by the merchant portal's dashboard payment-method breakdown.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT;
 
 -- tenant_id is included directly here (not just reachable via order_id ->
 -- orders.tenant_id) for the same reason the hospital schema's

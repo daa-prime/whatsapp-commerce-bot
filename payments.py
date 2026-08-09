@@ -74,6 +74,7 @@ class PaymentWebhookEvent:
     tenant_id: int | None
     order_id: int | None
     payment_gateway_reference: str | None  # Razorpay's payment id (pay_xxx) or payment_link id (plink_xxx)
+    payment_method: str | None  # "upi"/"card"/"netbanking"/"wallet"/etc, only present once a payment is captured
 
 
 def _build_reference_id(tenant_id: int, order_id: int) -> str:
@@ -193,6 +194,20 @@ def _extract_payment_gateway_reference(payload: dict) -> str | None:
     return link_entity.get("id")
 
 
+def _extract_payment_method(payload: dict) -> str | None:
+    """Reads Razorpay's payment method (e.g. "upi"/"card"/"netbanking"/
+    "wallet") off the same payment.entity dict _extract_payment_gateway_reference
+    already reads .id from -- only present once a payment has actually been
+    captured (a payment_link.expired event with no payment attempted has no
+    payment entity at all, so this correctly returns None for that case).
+    Used by the merchant portal's dashboard payment-method breakdown; not
+    verified against a live webhook delivery, same caveat as this module's
+    other payload-path extractions (see module docstring)."""
+    inner = payload.get("payload", {})
+    payment_entity = inner.get("payment", {}).get("entity", {})
+    return payment_entity.get("method")
+
+
 def parse_payment_webhook(payload: dict) -> PaymentWebhookEvent:
     """Normalizes a raw Razorpay webhook payload into a PaymentWebhookEvent.
     Centralizes payload parsing so nothing else in the app touches
@@ -203,9 +218,11 @@ def parse_payment_webhook(payload: dict) -> PaymentWebhookEvent:
     reference_id = _extract_reference_id(payload)
     tenant_id, order_id = _parse_reference_id(reference_id)
     payment_gateway_reference = _extract_payment_gateway_reference(payload)
+    payment_method = _extract_payment_method(payload)
     return PaymentWebhookEvent(
         event_type=event_type,
         tenant_id=tenant_id,
         order_id=order_id,
         payment_gateway_reference=payment_gateway_reference,
+        payment_method=payment_method,
     )

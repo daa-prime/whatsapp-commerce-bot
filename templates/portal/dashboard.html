@@ -1,0 +1,112 @@
+{% extends "portal/_base.html" %}
+{% block title %}Dashboard — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<h1>Dashboard</h1>
+<p class="subtitle">{{ tenant.name }}</p>
+
+<div class="stat-tiles">
+  <div class="card stat-tile">
+    <div class="stat-label">Total sales (today)</div>
+    <div class="stat-value">₹{{ "%.2f"|format(stats.sales_today) }}</div>
+    <div class="stat-delta {{ sales_delta_class }}">
+      {% if stats.sales_delta_pct is none %}vs. yesterday: --{% else %}{{ "%+d"|format(stats.sales_delta_pct) }}% vs. yesterday{% endif %}
+    </div>
+  </div>
+  <div class="card stat-tile">
+    <div class="stat-label">Orders (today)</div>
+    <div class="stat-value">{{ stats.orders_today }}</div>
+    <div class="stat-delta {{ orders_delta_class }}">
+      {% if stats.orders_delta_pct is none %}vs. yesterday: --{% else %}{{ "%+d"|format(stats.orders_delta_pct) }}% vs. yesterday{% endif %}
+    </div>
+  </div>
+  <div class="card stat-tile">
+    <div class="stat-label">Avg. order value</div>
+    <div class="stat-value">₹{{ "%.2f"|format(stats.avg_order_value) }}</div>
+  </div>
+  <div class="card stat-tile">
+    <div class="stat-label">Total customers</div>
+    <div class="stat-value">{{ stats.total_customers }}</div>
+  </div>
+  <div class="card stat-tile">
+    <div class="stat-label">Pending orders</div>
+    <div class="stat-value">{{ stats.pending_orders }}</div>
+  </div>
+</div>
+
+<div class="charts-row">
+  <div class="card">
+    <h2>Weekly sales trend</h2>
+    {% if stats.weekly_trend %}
+    <svg viewBox="0 0 {{ chart_width }} {{ chart_height }}" width="100%" height="{{ chart_height }}">
+      <polyline points="{{ trend_polyline }}" fill="none" stroke="var(--color-primary)" stroke-width="2.5"
+                stroke-linejoin="round" stroke-linecap="round" />
+      {% for p in trend_points %}
+      <circle cx="{{ p.x }}" cy="{{ p.y }}" r="3" fill="var(--color-primary)"><title>{{ p.label }}: ₹{{ "%.2f"|format(p.total) }}</title></circle>
+      {% endfor %}
+    </svg>
+    <div style="display: flex; justify-content: space-between; font-size: 0.78rem; color: var(--color-muted); margin-top: var(--space-1);">
+      {% for p in trend_points %}<span>{{ p.label }}</span>{% endfor %}
+    </div>
+    {% else %}
+    <p class="hint">No paid orders in the last 7 days yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h2>Payment methods</h2>
+    {% if donut_legend %}
+    <div class="donut" style="width: 140px; height: 140px; border-radius: 50%; position: relative; margin: 0 auto; background: conic-gradient({{ donut_gradient }});">
+      <div style="position: absolute; top: 22px; left: 22px; width: 96px; height: 96px; border-radius: 50%; background: var(--color-surface);"></div>
+    </div>
+    <ul class="donut-legend">
+      {% for seg in donut_legend %}
+      <li><span class="swatch" style="background: {{ seg.color }};"></span> {{ seg.method }} — {{ seg.count }} ({{ seg.pct }}%)</li>
+      {% endfor %}
+    </ul>
+    {% else %}
+    <p class="hint">No paid orders yet.</p>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Top categories</h2>
+  {% if top_categories %}
+  {% for c in top_categories %}
+  <div style="margin-bottom: var(--space-2);">
+    <div style="display: flex; justify-content: space-between; font-size: 0.85rem; margin-bottom: 2px;">
+      <span>{{ c.category }}</span><span>₹{{ "%.2f"|format(c.revenue) }}</span>
+    </div>
+    <div style="background: var(--color-border); border-radius: 4px; height: 8px;">
+      <div style="background: var(--color-primary); border-radius: 4px; height: 8px; width: {{ c.pct }}%;"></div>
+    </div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p class="hint">No paid orders with categorized products yet.</p>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>Recent orders</h2>
+  {% if stats.recent_orders %}
+  <table class="data-table">
+    <thead><tr><th>Order</th><th>Customer</th><th>Amount</th><th>Status</th></tr></thead>
+    <tbody>
+      {% for o in stats.recent_orders %}
+      <tr>
+        <td><a href="/portal/orders/{{ o.id }}">#{{ o.id }}</a></td>
+        <td>{{ o.customer_phone }}</td>
+        <td>{% if o.total %}₹{{ "%.2f"|format(o.total) }}{% else %}--{% endif %}</td>
+        <td><span class="status-badge {{ o.status }}">{{ o.status }}</span></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="hint">No orders yet.</p>
+  {% endif %}
+</div>
+
+{% endblock %}

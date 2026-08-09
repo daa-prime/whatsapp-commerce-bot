@@ -39,6 +39,7 @@ class Tenant:
     data_tier: str
     external_api_base_url: str | None
     external_api_key: str | None
+    portal_password_hash: str | None  # merchant portal login (portal/session.py); NULL until an admin sets one
 
 
 def _row_to_tenant(row) -> Tenant:
@@ -60,6 +61,7 @@ def _row_to_tenant(row) -> Tenant:
         data_tier=row["data_tier"],
         external_api_base_url=row["external_api_base_url"],
         external_api_key=row["external_api_key"],
+        portal_password_hash=row["portal_password_hash"],
     )
 
 
@@ -181,6 +183,21 @@ def update_tenant_catalog_and_payment(
     conn.commit()
 
 
+def set_tenant_portal_password_hash(tenant_id: int, password_hash: str) -> None:
+    """Sets/resets a tenant's merchant-portal login password (portal/session.py
+    hashes it before calling this -- this function never sees a plaintext
+    password). Admin-only (admin/onboarding.py's portal-password page) since
+    merchant self-serve signup is out of scope for now -- always a full
+    overwrite, never COALESCE, since resetting a password always means
+    replacing whatever hash (or NULL) was there before."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE tenants SET portal_password_hash = ? WHERE id = ?",
+        (password_hash, tenant_id),
+    )
+    conn.commit()
+
+
 # --- Products (SPEC.md Section 4, mirrors Meta's catalog for pricing/stock lookups) ---
 
 @dataclass
@@ -272,6 +289,57 @@ def update_product_stock(tenant_id: int, product_id: int, stock_quantity: int) -
     conn.commit()
 
 
+def get_all_products(tenant_id: int) -> list[Product]:
+    """Every product for a tenant, active or not -- unlike get_active_products
+    (which the customer-facing shop flow uses), the merchant portal's product
+    list needs to show deactivated products too so they can be re-activated."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM products WHERE tenant_id = ? ORDER BY id",
+        (tenant_id,),
+    ).fetchall()
+    return [_row_to_product(r) for r in rows]
+
+
+def update_product(
+    tenant_id: int,
+    product_id: int,
+    name: str,
+    price: Decimal,
+    description: str | None,
+    image_url: str | None,
+    sku: str | None,
+    stock_quantity: int,
+    category: str | None,
+) -> Product | None:
+    """The merchant portal's product-edit form -- always a full overwrite of
+    every field (the edit form pre-fills current values, so a blank field on
+    submit means "clear it"), unlike update_tenant_catalog_and_payment's
+    COALESCE "blank means keep current" convention (which exists for a form
+    an operator may only be touching up partially, not a full record edit)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE products SET name = ?, price = ?, description = ?, image_url = ?, "
+        "sku = ?, stock_quantity = ?, category = ? WHERE tenant_id = ? AND id = ?",
+        (name, price, description, image_url, sku, stock_quantity, category, tenant_id, product_id),
+    )
+    conn.commit()
+    return get_product(tenant_id, product_id)
+
+
+def set_product_active(tenant_id: int, product_id: int, is_active: bool) -> None:
+    """Toggle a product's visibility to customers without deleting it --
+    deactivated products still show up in get_all_products (portal) and past
+    orders' order_items, just excluded from get_active_products (the
+    customer-facing shop flow)."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE products SET is_active = ? WHERE tenant_id = ? AND id = ?",
+        (1 if is_active else 0, tenant_id, product_id),
+    )
+    conn.commit()
+
+
 # --- Orders (SPEC.md Section 4) ---
 
 ORDER_STATUS_BROWSING = "browsing"
@@ -295,6 +363,7 @@ class Order:
     created_at: str
     paid_at: str | None
     nudge_sent_at: str | None
+    payment_method: str | None  # e.g. "upi"/"card"/"netbanking"/"wallet" (payments.py); NULL until paid
 
 
 def _row_to_order(row) -> Order:
@@ -310,6 +379,7 @@ def _row_to_order(row) -> Order:
         created_at=row["created_at"],
         paid_at=row["paid_at"],
         nudge_sent_at=row["nudge_sent_at"],
+        payment_method=row["payment_method"],
     )
 
 
@@ -329,6 +399,25 @@ def get_orders_for_phone(tenant_id: int, customer_phone: str) -> list[Order]:
         "SELECT * FROM orders WHERE tenant_id = ? AND customer_phone = ? ORDER BY created_at DESC",
         (tenant_id, customer_phone),
     ).fetchall()
+    return [_row_to_order(r) for r in rows]
+
+
+def list_orders(tenant_id: int, status: str | None = None, limit: int | None = None) -> list[Order]:
+    """The merchant portal's tenant-wide order list (unlike
+    get_orders_for_phone, which is scoped to one customer) -- optionally
+    filtered by status (the portal's orders page) or capped to the N most
+    recent (the dashboard's recent-orders table), most recent first."""
+    conn = get_connection()
+    sql = "SELECT * FROM orders WHERE tenant_id = ?"
+    params: list = [tenant_id]
+    if status:
+        sql += " AND status = ?"
+        params.append(status)
+    sql += " ORDER BY created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(sql, tuple(params)).fetchall()
     return [_row_to_order(r) for r in rows]
 
 
@@ -539,6 +628,7 @@ def update_order_payment_link(
 
 def mark_order_paid(
     tenant_id: int, order_id: int, payment_gateway_reference: str | None, paid_at: str,
+    payment_method: str | None = None,
 ) -> bool:
     """Atomically transitions an order to ORDER_STATUS_PAID -- `WHERE status
     != 'paid'` means a duplicate/concurrent payment webhook delivery for an
@@ -548,6 +638,11 @@ def mark_order_paid(
     concurrent webhook deliveries for the same order must not both see
     "not yet paid" and both act on it.
 
+    payment_method (e.g. "upi"/"card"/"netbanking") is COALESCEd like
+    payment_gateway_reference -- optional (defaults to None for any caller
+    that doesn't have it, e.g. existing tests), never overwrites a value
+    that's somehow already there.
+
     Returns True only if THIS call is the one that actually made the
     transition -- callers (core/commerce_flow.py's handle_payment_success)
     use that to decide whether to send the "payment received" WhatsApp
@@ -556,9 +651,11 @@ def mark_order_paid(
     cur = conn.execute(
         "UPDATE orders SET status = ?, "
         "payment_gateway_reference = COALESCE(?, payment_gateway_reference), "
+        "payment_method = COALESCE(?, payment_method), "
         "paid_at = ? "
         "WHERE tenant_id = ? AND id = ? AND status != ?",
-        (ORDER_STATUS_PAID, payment_gateway_reference, paid_at, tenant_id, order_id, ORDER_STATUS_PAID),
+        (ORDER_STATUS_PAID, payment_gateway_reference, payment_method, paid_at,
+         tenant_id, order_id, ORDER_STATUS_PAID),
     )
     conn.commit()
     return cur.rowcount > 0
@@ -582,6 +679,139 @@ def mark_order_failed(tenant_id: int, order_id: int) -> bool:
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+def mark_order_fulfilled(tenant_id: int, order_id: int) -> bool:
+    """The merchant portal's "mark as shipped/delivered" action -- same
+    atomic-conditional-transition pattern as mark_order_paid/mark_order_failed.
+    `WHERE status = 'paid'` means this can only ever move a *paid* order to
+    fulfilled (an unpaid order has nothing to fulfill), and a duplicate click
+    is a safe no-op.
+
+    Returns True only if THIS call made the transition -- callers use that to
+    show a clear "already fulfilled" vs "done" message rather than silently
+    succeeding either way."""
+    conn = get_connection()
+    cur = conn.execute(
+        "UPDATE orders SET status = ? WHERE tenant_id = ? AND id = ? AND status = ?",
+        (ORDER_STATUS_FULFILLED, tenant_id, order_id, ORDER_STATUS_PAID),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
+def get_dashboard_stats(tenant_id: int, timezone: str) -> dict:
+    """Everything the merchant portal's dashboard needs, in one call --
+    stat tiles (today vs. yesterday sales/orders, all-time paid AOV, distinct
+    customers, pending count), a 7-day paid-sales trend, a payment-method
+    breakdown, top-5 categories by paid revenue, and the 10 most recent
+    orders. One function rather than several smaller ones because every
+    query here shares the same "today" boundary computed once from the
+    tenant's own timezone (SPEC.md Section 3.4's existing per-tenant
+    timezone use) -- computing it separately per call site would risk two
+    queries disagreeing about where "today" starts.
+
+    Day boundaries are computed in Python (zoneinfo, stdlib) rather than in
+    SQL, then compared against created_at/paid_at cast to timestamptz -- same
+    "avoid TEXT-format mismatches, compare as timestamptz" reasoning as
+    get_abandoned_orders above."""
+    from datetime import datetime, timedelta
+    from zoneinfo import ZoneInfo
+
+    conn = get_connection()
+    tz = ZoneInfo(timezone)
+    now_local = datetime.now(tz)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    tomorrow_start = today_start + timedelta(days=1)
+    yesterday_start = today_start - timedelta(days=1)
+    week_start = today_start - timedelta(days=6)  # last 7 days, inclusive of today
+
+    def _one(sql: str, params: tuple):
+        row = conn.execute(sql, params).fetchone()
+        return list(row.values())[0] if row else None
+
+    sales_today = _one(
+        "SELECT COALESCE(SUM(total), 0) FROM orders WHERE tenant_id = ? AND status = ? "
+        "AND paid_at::timestamptz >= ? AND paid_at::timestamptz < ?",
+        (tenant_id, ORDER_STATUS_PAID, today_start, tomorrow_start),
+    )
+    sales_yesterday = _one(
+        "SELECT COALESCE(SUM(total), 0) FROM orders WHERE tenant_id = ? AND status = ? "
+        "AND paid_at::timestamptz >= ? AND paid_at::timestamptz < ?",
+        (tenant_id, ORDER_STATUS_PAID, yesterday_start, today_start),
+    )
+    orders_today = _one(
+        "SELECT COUNT(*) FROM orders WHERE tenant_id = ? "
+        "AND created_at::timestamptz >= ? AND created_at::timestamptz < ?",
+        (tenant_id, today_start, tomorrow_start),
+    )
+    orders_yesterday = _one(
+        "SELECT COUNT(*) FROM orders WHERE tenant_id = ? "
+        "AND created_at::timestamptz >= ? AND created_at::timestamptz < ?",
+        (tenant_id, yesterday_start, today_start),
+    )
+    avg_order_value = _one(
+        "SELECT AVG(total) FROM orders WHERE tenant_id = ? AND status = ?",
+        (tenant_id, ORDER_STATUS_PAID),
+    ) or Decimal("0")
+    total_customers = _one(
+        "SELECT COUNT(DISTINCT customer_phone) FROM orders WHERE tenant_id = ?",
+        (tenant_id,),
+    )
+    pending_orders = _one(
+        "SELECT COUNT(*) FROM orders WHERE tenant_id = ? AND status = ?",
+        (tenant_id, ORDER_STATUS_PENDING_PAYMENT),
+    )
+
+    def _delta_pct(today_val, yesterday_val):
+        if not yesterday_val:
+            return None  # no comparable baseline -- template shows "--" rather than a misleading 0%/infinite%
+        return round((float(today_val) - float(yesterday_val)) / float(yesterday_val) * 100)
+
+    trend_rows = conn.execute(
+        "SELECT (paid_at::timestamptz AT TIME ZONE ?)::date AS day, SUM(total) AS total "
+        "FROM orders WHERE tenant_id = ? AND status = ? AND paid_at::timestamptz >= ? "
+        "GROUP BY day ORDER BY day",
+        (timezone, tenant_id, ORDER_STATUS_PAID, week_start),
+    ).fetchall()
+    by_day = {r["day"]: r["total"] for r in trend_rows}
+    weekly_trend = []
+    for i in range(7):
+        day = (week_start + timedelta(days=i)).date()
+        weekly_trend.append({"label": day.strftime("%a"), "total": by_day.get(day, Decimal("0"))})
+
+    payment_method_rows = conn.execute(
+        "SELECT COALESCE(payment_method, 'unknown') AS method, COUNT(*) AS cnt "
+        "FROM orders WHERE tenant_id = ? AND status = ? GROUP BY method ORDER BY cnt DESC",
+        (tenant_id, ORDER_STATUS_PAID),
+    ).fetchall()
+    payment_method_breakdown = [{"method": r["method"], "count": r["cnt"]} for r in payment_method_rows]
+
+    top_category_rows = conn.execute(
+        "SELECT COALESCE(p.category, 'Uncategorized') AS category, "
+        "SUM(oi.quantity * oi.unit_price_at_order_time) AS revenue "
+        "FROM order_items oi "
+        "JOIN orders o ON o.id = oi.order_id AND o.tenant_id = oi.tenant_id "
+        "JOIN products p ON p.id = oi.product_id AND p.tenant_id = oi.tenant_id "
+        "WHERE oi.tenant_id = ? AND o.status = ? "
+        "GROUP BY category ORDER BY revenue DESC LIMIT 5",
+        (tenant_id, ORDER_STATUS_PAID),
+    ).fetchall()
+    top_categories = [{"category": r["category"], "revenue": r["revenue"]} for r in top_category_rows]
+
+    return {
+        "sales_today": sales_today,
+        "sales_delta_pct": _delta_pct(sales_today, sales_yesterday),
+        "orders_today": orders_today,
+        "orders_delta_pct": _delta_pct(orders_today, orders_yesterday),
+        "avg_order_value": avg_order_value,
+        "total_customers": total_customers,
+        "pending_orders": pending_orders,
+        "weekly_trend": weekly_trend,
+        "payment_method_breakdown": payment_method_breakdown,
+        "top_categories": top_categories,
+        "recent_orders": list_orders(tenant_id, limit=10),
+    }
 
 
 def get_abandoned_orders(tenant_id: int, older_than_hours: float) -> list[Order]:

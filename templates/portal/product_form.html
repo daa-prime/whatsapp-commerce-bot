@@ -1,0 +1,41 @@
+{% extends "portal/_base.html" %}
+{% block title %}{{ "Edit product" if product else "Add product" }} — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<p><a href="/portal/products" class="btn-link">&larr; Back to products</a></p>
+<h1>{{ "Edit product" if product else "Add product" }}</h1>
+
+{% if errors %}
+<div class="error-banner"><strong>Please fix the following:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<div class="card">
+  <form method="post" action="{{ '/portal/products/' + product.id|string + '/edit' if product else '/portal/products/new' }}">
+    <label>Name</label>
+    <input type="text" name="name" value="{{ v.name }}" required>
+
+    <label>Price (INR)</label>
+    <input type="text" name="price" value="{{ v.price }}" required>
+
+    <label>Description</label>
+    <textarea name="description">{{ v.description }}</textarea>
+
+    <label>Image URL</label>
+    <input type="text" name="image_url" value="{{ v.image_url }}">
+
+    <label>SKU</label>
+    <input type="text" name="sku" value="{{ v.sku }}">
+
+    <label>Stock quantity</label>
+    <input type="text" name="stock_quantity" value="{{ v.stock_quantity }}">
+
+    <label>Category</label>
+    <input type="text" name="category" value="{{ v.category }}">
+
+    <button type="submit" class="btn btn-primary" style="margin-top: var(--space-5);">{{ "Save changes" if product else "Add product" }}</button>
+  </form>
+</div>
+
+{% endblock %}

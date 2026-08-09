@@ -1,0 +1,73 @@
+{% extends "portal/_base.html" %}
+{% block title %}Settings — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<h1>Settings</h1>
+
+{% if errors %}
+<div class="error-banner"><strong>Please fix the following:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+{% if saved %}
+<div class="ok-banner">Settings saved.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Catalog &amp; payment</h2>
+  <form method="post" action="/portal/settings">
+    <label>Meta Catalog ID</label>
+    <input type="text" name="meta_catalog_id" placeholder="Currently: {{ tenant.meta_catalog_id or 'not set' }}">
+    <p class="hint">Leave blank to keep it as-is.</p>
+
+    <label>Payment gateway provider</label>
+    <select name="payment_gateway_provider">
+      <option value="">Keep current ({{ tenant.payment_gateway_provider or "not set" }})</option>
+      <option value="razorpay">Razorpay</option>
+    </select>
+
+    <label>Razorpay Key ID</label>
+    <input type="text" name="payment_gateway_key_id" placeholder="Currently: {{ tenant.payment_gateway_key_id or 'not set' }}">
+
+    <label>Razorpay Key Secret</label>
+    <input type="password" name="payment_gateway_api_key_ref">
+    <p class="hint">Currently: {{ "set" if tenant.payment_gateway_api_key_ref else "not set" }}. Leave blank to keep it as-is.</p>
+
+    <label>Razorpay Webhook Secret</label>
+    <input type="password" name="payment_gateway_webhook_secret">
+    <p class="hint">Currently: {{ "set" if tenant.payment_gateway_webhook_secret else "not set" }}. Leave blank to keep it as-is.</p>
+
+    <label>Abandoned cart nudge (hours)</label>
+    <input type="text" name="abandoned_cart_nudge_hours" placeholder="Currently: {{ tenant.abandoned_cart_nudge_hours }}">
+    <p class="hint">Leave blank to keep it as-is.</p>
+
+    <button type="submit" class="btn btn-primary" style="margin-top: var(--space-5);">Save</button>
+  </form>
+</div>
+
+{% if password_errors %}
+<div class="error-banner"><strong>Please fix the following:</strong>
+  <ul>{% for e in password_errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+{% if password_saved %}
+<div class="ok-banner">Password updated.</div>
+{% endif %}
+
+<div class="card">
+  <h2>Change password</h2>
+  <form method="post" action="/portal/settings/password">
+    <label>Current password</label>
+    <input type="password" name="current_password" required>
+
+    <label>New password</label>
+    <input type="password" name="new_password" required>
+
+    <label>Confirm new password</label>
+    <input type="password" name="confirm_password" required>
+
+    <button type="submit" class="btn btn-primary" style="margin-top: var(--space-5);">Change password</button>
+  </form>
+</div>
+
+{% endblock %}

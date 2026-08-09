@@ -10,6 +10,11 @@ import pytest
 # in this directory, so this is the one place that setting can't lose a race
 # against which test file pytest happens to collect first.
 os.environ.setdefault("ADMIN_SECRET", "test-admin-secret")
+# Same reasoning as ADMIN_SECRET above -- portal/session.py reads these at
+# import time (module-level), and admin.onboarding/portal.* modules get
+# imported transitively the first time any test does `from core.main import app`.
+os.environ.setdefault("PORTAL_SESSION_SECRET", "test-portal-session-secret")
+os.environ.setdefault("PORTAL_COOKIE_SECURE", "false")  # tests run over plain TestClient HTTP, not real HTTPS
 
 # The app runs on Postgres (Neon in production), so tests need a real Postgres
 # to run against -- an in-memory swap-in-a-connection trick (a plain

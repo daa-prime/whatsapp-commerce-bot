@@ -1,0 +1,30 @@
+{% extends "portal/_base.html" %}
+{% block title %}Import products — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<p><a href="/portal/products" class="btn-link">&larr; Back to products</a></p>
+<h1>Bulk import products (CSV)</h1>
+
+{% if errors %}
+<div class="error-banner"><strong>Please fix the following:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+{% if imported_count is not none %}
+<div class="ok-banner">Imported {{ imported_count }} product{{ "s" if imported_count != 1 else "" }}.</div>
+{% endif %}
+
+<div class="card">
+  <p class="hint">
+    CSV columns: <code>name, price, description, image_url, sku, stock_quantity, category</code>
+    — only <code>name</code> and <code>price</code> are required.
+  </p>
+  <form method="post" action="/portal/products/import" enctype="multipart/form-data">
+    <label>CSV file</label>
+    <input type="file" name="csv_file" accept=".csv" required>
+    <button type="submit" class="btn btn-primary" style="margin-top: var(--space-5);">Import</button>
+  </form>
+</div>
+
+{% endblock %}

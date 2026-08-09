@@ -24,6 +24,7 @@ from fastapi import APIRouter, Form
 from fastapi.responses import HTMLResponse
 
 import db.repository as db
+from portal.session import hash_password
 
 router = APIRouter()
 
@@ -211,3 +212,99 @@ async def edit_tenant_catalog_payment_submit(
     )
 
     return _catalog_payment_confirmation_html(db.get_tenant(tenant_id))
+
+
+# --- Merchant portal login password (set/reset only -- no self-serve signup) ---
+# The merchant portal (portal/*.py) needs a password to log in with; there's
+# no self-serve signup flow, so an admin sets/resets it here, same
+# ADMIN_SECRET-gated pattern as the catalog/payment edit step above.
+
+def _portal_password_form_html(tenant, errors: list[str] | None = None, values: dict | None = None) -> str:
+    import html
+    v = values or {}
+
+    def esc(key: str) -> str:
+        return html.escape(str(v.get(key, "")))
+
+    error_html = ""
+    if errors:
+        items = "".join(f"<li>{html.escape(e)}</li>" for e in errors)
+        error_html = f'<div class="error"><strong>Please fix the following:</strong><ul>{items}</ul></div>'
+
+    password_current = "set" if tenant.portal_password_hash else "not set"
+
+    return f"""<!doctype html>
+<html>
+<head><title>Portal password — {html.escape(tenant.name)}</title>{_PAGE_STYLE}</head>
+<body>
+  <h1>Merchant portal password — {html.escape(tenant.name)}</h1>
+  {error_html}
+  <form method="post" action="/admin/tenant/{tenant.id}/portal-password">
+    <label>Admin secret</label>
+    <input type="password" name="admin_secret" value="{esc('admin_secret')}" required>
+
+    <label>New password</label>
+    <input type="password" name="new_password" required>
+    <p class="hint">Currently: {password_current}. Must be at least 8 characters. The merchant logs in at
+      /portal/login with their WhatsApp phone number ID and this password.</p>
+
+    <label>Confirm new password</label>
+    <input type="password" name="confirm_password" required>
+
+    <button type="submit">Save</button>
+  </form>
+</body>
+</html>"""
+
+
+def _portal_password_confirmation_html(tenant) -> str:
+    import html
+    return f"""<!doctype html>
+<html>
+<head><title>Portal password updated</title>{_PAGE_STYLE}</head>
+<body>
+  <h1>Merchant portal password updated</h1>
+  <div class="ok"><strong>{html.escape(tenant.name)}</strong>'s portal login password was set.
+    They can now log in at /portal/login with phone number ID <strong>{html.escape(tenant.whatsapp_phone_number_id or "")}</strong>.</div>
+  <p><a href="/admin/tenant/{tenant.id}/portal-password">Reset again</a></p>
+</body>
+</html>"""
+
+
+@router.get("/admin/tenant/{tenant_id}/portal-password", response_class=HTMLResponse)
+async def portal_password_form(tenant_id: int):
+    tenant = db.get_tenant(tenant_id)
+    if tenant is None:
+        return HTMLResponse("<p>Tenant not found.</p>", status_code=404)
+    return _portal_password_form_html(tenant)
+
+
+@router.post("/admin/tenant/{tenant_id}/portal-password", response_class=HTMLResponse)
+async def portal_password_submit(
+    tenant_id: int,
+    admin_secret: str = Form(""),
+    new_password: str = Form(""),
+    confirm_password: str = Form(""),
+):
+    tenant = db.get_tenant(tenant_id)
+    if tenant is None:
+        return HTMLResponse("<p>Tenant not found.</p>", status_code=404)
+
+    values = {"admin_secret": admin_secret}
+
+    if admin_secret != ADMIN_SECRET:
+        return HTMLResponse(_portal_password_form_html(tenant, ["Incorrect admin secret."], values), status_code=403)
+
+    if len(new_password) < 8:
+        return HTMLResponse(
+            _portal_password_form_html(tenant, ["Password must be at least 8 characters."], values), status_code=400,
+        )
+
+    if new_password != confirm_password:
+        return HTMLResponse(
+            _portal_password_form_html(tenant, ["Password and confirmation do not match."], values), status_code=400,
+        )
+
+    db.set_tenant_portal_password_hash(tenant_id, hash_password(new_password))
+
+    return _portal_password_confirmation_html(db.get_tenant(tenant_id))
