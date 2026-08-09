@@ -13,6 +13,7 @@ from fastapi.responses import PlainTextResponse
 
 import db.repository as db
 from admin.onboarding import router as onboarding_router
+from core.commerce_flow import handle_incoming
 from core.history import get_history, get_session_store
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
 from db.init_db import init_db
@@ -210,18 +211,16 @@ async def _process_message(wa: WhatsAppClient, tenant: db.Tenant, phone: str, re
     """Process a single already-parsed incoming message with the (tenant, phone)
     lock already held.
 
-    Placeholder until Phase 2 builds the order-received webhook handler
-    (SPEC.md Section 3.2): for now every message just gets the tenant's
-    welcome message back, which proves the webhook/signature/routing/lock
-    plumbing above works end-to-end without any order/cart logic yet. Meta's
-    native catalog/cart messages (SPEC.md Section 2) are what will actually
-    drive customers to this bot; Phase 1 wires up a real test catalog, Phase 2
-    replaces this stub with parsing the resulting `order` message type.
+    Dispatches to core/commerce_flow.py's menu-driven state machine (Shop Now,
+    My Orders, Track Order, cart, checkout). This is a manual "type a message
+    to get a menu" flow, not yet driven by Meta's native catalog/cart
+    messages (SPEC.md Section 2) — Phase 1's real catalog integration and
+    Phase 2's `order` message type parsing still replace/extend this once a
+    live test catalog exists.
     """
     logger.info("Dispatching message from %s (tenant %s): %s", phone, tenant.id, reply)
     HISTORY.add(phone, "user", reply.get("text") or reply.get("title") or f"[{reply.get('type')}]")
-    welcome = tenant.welcome_message_text or f"Welcome to {tenant.name}! Our catalog is coming soon."
-    await wa.send_text(phone, welcome)
+    await handle_incoming(wa, SESSIONS, phone, tenant.id, reply, tenant.name)
 
 
 @app.post("/internal/send-abandoned-cart-nudges")

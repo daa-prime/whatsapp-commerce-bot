@@ -12,9 +12,9 @@ Customers message the business's WhatsApp number, browse a product catalog nativ
 
 ## Status
 
-**Early — infrastructure only, no commerce features live yet.** This repo was forked from a working WhatsApp hospital-booking product to reuse its multi-tenant webhook infrastructure. Phase 0 (stripping the hospital domain logic, keeping the infra) is done. Catalog integration, order handling, payment, and invoicing are not built yet. See [Spec.md](Spec.md) Section 0 for the current build-phase status in detail, and Section 5 for the full phase plan.
+**A customer can shop and check out today, but only through a manual bot-driven menu, not Meta's native catalog/cart — and there's no payment step yet.** This repo was forked from a working WhatsApp hospital-booking product to reuse its multi-tenant webhook infrastructure. See [Spec.md](Spec.md) Section 0 for the current build-phase status in detail, and Section 5 for the full phase plan.
 
-What works right now: a message sent to a registered WhatsApp number is received, routed to the correct tenant, signature-verified, and replied to with that tenant's welcome message. That's it — there's no catalog, cart, order, or payment flow yet.
+What works right now: a customer messages the bot, taps through Shop Now → browse products → add to cart → view cart → checkout, and a real `pending_payment` order is created in the database. What doesn't exist yet: Meta Commerce Manager catalog integration (so browsing happens via a bot-built list, not WhatsApp's native catalog UI), payment link generation, and invoicing — checkout currently ends at a "Payment integration coming next" placeholder.
 
 ---
 
@@ -24,10 +24,11 @@ What works right now: a message sent to a registered WhatsApp number is received
 |---|---|
 | Meta webhook receipt, HMAC signature validation | ✅ Working |
 | Multi-tenant routing (one deployment, many businesses) | ✅ Working |
-| Products/orders/order_items data model + CRUD | ✅ Built (built ahead of schedule; not wired to any webhook yet) |
-| Product catalog (via Meta Commerce Manager) | ❌ Not started |
-| Order-received webhook handling | ❌ Not started |
-| Payment link generation + gateway webhook (Razorpay) | ❌ Not started |
+| Products/orders/order_items data model + CRUD | ✅ Built |
+| Shop/cart/checkout conversation flow, My Orders, Track Order | ✅ Built (menu-driven bot flow, not Meta's native catalog/cart yet) |
+| Product catalog (via Meta Commerce Manager) | ❌ Not started — products are entered manually for now |
+| Order-received webhook handling (Meta's native `order` message type) | ❌ Not started — `commerce_flow.py`'s cart is a manual substitute |
+| Payment link generation + gateway webhook (Razorpay) | ❌ Not started — checkout stops at a placeholder message |
 | PDF invoice generation + delivery | ❌ Not started |
 | Onboarding wizard: catalog/payment-gateway setup | ❌ Not started |
 
@@ -50,13 +51,20 @@ Customer sends WhatsApp message
 └─────────┬──────────┘     Meta credentials
           │
           ▼
-┌───────────────────┐
-│  Reply with tenant's │ ◄── placeholder pending Phase 2's real
-│  welcome message     │     order-received handling (Spec.md 3.2)
-└───────────────────┘
+┌───────────────────────┐
+│  core/commerce_flow.py │ ◄── menu-driven state machine: Shop Now,
+│  Shop → Cart → Checkout │     My Orders, Track Order, Offers/Account/
+└─────────┬──────────────┘     Talk to Us placeholders (Spec.md 3)
+          │
+          ▼
+┌───────────────────────┐
+│  Checkout creates a real│ ◄── orders (pending_payment) + order_items,
+│  order, stops at a      │     then a placeholder message -- Phase 3's
+│  payment placeholder     │     Razorpay integration isn't built yet
+└───────────────────────┘
 ```
 
-Once catalog/order support lands, the flow becomes: customer browses Meta's native catalog UI → taps "Add to cart" → taps "Send order" → this webhook receives an `order` message → replies with a summary + Razorpay payment link → payment webhook confirms → invoice sent as a WhatsApp document.
+This is a temporary substitute for Meta's native catalog/cart (Spec.md Section 2) — once Phase 1's real catalog is linked, browsing should move to WhatsApp's own catalog UI, and this flow's job narrows to handling the resulting `order` webhook plus My Orders/Track Order/checkout.
 
 ---
 
@@ -114,7 +122,7 @@ Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 pytest tests/ -v
 ```
 
-84 tests across 8 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, and the products/orders/order_items data model's CRUD layer. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
+98 tests across 9 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, the products/orders/order_items CRUD layer, and the full shop/cart/checkout conversation flow (including cross-tenant isolation and the 10-row list cap). Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
 
 ---
 
@@ -150,6 +158,7 @@ uvicorn core.main:app --host 0.0.0.0 --port $PORT
 whatsapp-commerce-bot/
 ├── core/
 │   ├── main.py          # FastAPI app, webhook receipt/routing, message locking
+│   ├── commerce_flow.py  # Shop/cart/checkout/orders state machine (menu-driven)
 │   ├── whatsapp.py       # WhatsApp Cloud API client, signature validation, payload parsing
 │   ├── history.py        # Conversation history + session store (Redis / in-memory)
 │   └── phone.py          # Phone number normalization
@@ -163,7 +172,7 @@ whatsapp-commerce-bot/
 │   └── seed.py            # Seed data (default tenant, test tenant)
 ├── reminders/
 │   └── scheduler.py       # Abandoned-cart-nudges placeholder (Phase 6, not implemented)
-└── tests/                 # 70 tests
+└── tests/                 # 98 tests
 ```
 
 See [Spec.md](Spec.md) for the full build spec and phase plan, and [DECISIONS.md](DECISIONS.md) for the architectural rationale carried over from the hospital-booking fork.

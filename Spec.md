@@ -6,19 +6,19 @@
 
 ## 0. Progress Log (update as you go)
 
-**Status (last updated after Phase 5's data model landed):**
+**Status (last updated after the menu-driven commerce conversation flow landed):**
 
 - **Phase 0 — done.** Hospital domain logic (`booking_flow.py`, doctor/slot scheduling, appointment reminders) is stripped. Infrastructure (Meta webhook receipt, per-tenant HMAC signature validation, multi-tenant routing, Postgres connection layer, Railway/Neon deployment config) is intact and renamed (`hospital_id`/`hospitals` → `tenant_id`/`tenants`). The orphaned Google Calendar/Mercado Pago prototype (`config/`, `modules/booking/`) that predated even the hospital product is also removed.
-- **Phase 1 (catalog setup) — not started.** No Meta Commerce Manager catalog is linked to any tenant; no test catalog message has been sent or verified.
-- **Phase 2 (order-received webhook handling) — not started.** `parse_incoming_message()` has no branch for Meta's `order` message type yet; an incoming order webhook today falls into the generic "unsupported" path.
-- **Phase 3 (payment integration) — not started.** No Razorpay (or any) SDK, no payment-link generation, no gateway webhook route.
+- **Phase 1 (catalog setup) — not started.** No Meta Commerce Manager catalog is linked to any tenant; no test catalog message has been sent or verified. Products are entered manually via `db.create_product` for now (no UI yet — see Phase 7).
+- **Phase 2 (order-received webhook handling) — partially done, via a manual flow rather than Meta's native cart.** `core/commerce_flow.py` is a new menu-driven state machine (Shop Now → browse → add to cart → view cart → checkout) wired into `core/main.py`'s webhook handler, so a customer can place an order today by typing/tapping through the bot. This is **not** SPEC.md Section 3.2's intended design — it doesn't parse Meta's native `order` message type (`parse_incoming_message()` still has no branch for it), because Phase 1's real catalog/cart isn't linked yet. Once it is, this manual product-browsing flow should likely be replaced or trimmed back in favor of Meta's native catalog UI, with `commerce_flow.py` handling just the resulting `order` webhook plus My Orders/Track Order.
+- **Phase 3 (payment integration) — not started.** Checkout creates a real `orders` row (`pending_payment`) + `order_items`, then stops at a "Payment integration coming next" placeholder message. No Razorpay (or any) SDK, no payment-link generation, no gateway webhook route yet.
 - **Phase 4 (invoice generation) — not started.** No PDF library, no WhatsApp document-send capability yet (`WhatsAppClient` only has `send_text`/`send_list`/`send_buttons`).
-- **Phase 5 (order/inventory data model) — done, built ahead of schedule.** `products`, `orders`, and `order_items` tables exist in `db/schema.sql` with basic CRUD in `db/repository.py`, since Phases 2–4 all depend on this data model existing first. Nothing in `core/main.py` writes to these tables yet — that wiring is still Phase 2/3 work.
-- **Phase 6 (edge cases) — a placeholder only.** `reminders/scheduler.py::send_abandoned_cart_nudges()` is a no-op stub wired to `/internal/send-abandoned-cart-nudges`, earmarked for the abandoned-cart-recovery edge case specifically. The rest of Phase 6 (payment/order-confirmation races, stock hitting zero mid-checkout, duplicate order messages) is unaddressed — there's no order-handling logic yet for those races to occur in.
-- **Phase 7 (onboarding wizard: catalog/payment-gateway steps) — not started.** `admin/onboarding.py` collects tenant identity, Meta credentials, and data-connection tier only; the `meta_catalog_id`/`payment_gateway_*` columns on `tenants` exist but nothing in the form writes to them.
-- **Phase 8 (multi-tenant support beyond the pilot) — not applicable yet.** No pilot tenant has gone through Phases 1–4, so there's nothing yet to extend to a second one.
+- **Phase 5 (order/inventory data model) — done.** `products`, `orders`, and `order_items` tables in `db/schema.sql` with CRUD in `db/repository.py`, now actually written to by `commerce_flow.py`'s checkout step (previously built but unused).
+- **Phase 6 (edge cases) — still mostly a placeholder.** `reminders/scheduler.py::send_abandoned_cart_nudges()` remains a no-op stub. Stock quantity is *not* checked or decremented anywhere in the new shop flow (a product can be "sold" past its `stock_quantity` with no warning) — deferred, matching this phase's explicit scope in the phase table. Payment/order-confirmation races and duplicate order messages remain unaddressed.
+- **Phase 7 (onboarding wizard: catalog/payment-gateway steps) — not started.** `admin/onboarding.py` collects tenant identity, Meta credentials, and data-connection tier only; there's still no UI for adding products or catalog/payment-gateway config.
+- **Phase 8 (multi-tenant support beyond the pilot) — not applicable yet.**
 
-`core/main.py`'s message handler is currently a placeholder that replies with the tenant's welcome message to every inbound message — it proves the webhook/signature/routing/lock chain works end-to-end, but there is no commerce functionality live yet.
+`core/main.py`'s message handler now dispatches to `core/commerce_flow.py` instead of a placeholder welcome message. A customer can complete a full shop → cart → checkout conversation and get a real `pending_payment` order in the database; nothing past that (payment, invoicing) exists yet.
 
 ---
 
