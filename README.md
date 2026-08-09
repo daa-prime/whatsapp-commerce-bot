@@ -26,6 +26,7 @@ What works right now: a customer messages the bot, taps through Shop Now → bro
 | Multi-tenant routing (one deployment, many businesses) | ✅ Working |
 | Products/orders/order_items data model + CRUD | ✅ Built |
 | Shop/cart/checkout conversation flow, My Orders, Track Order | ✅ Built (menu-driven bot flow, not Meta's native catalog/cart yet) |
+| Stock checks + race-safe decrement + duplicate-checkout protection | ✅ Hardened — see [DECISIONS.md](DECISIONS.md) |
 | Product catalog (via Meta Commerce Manager) | ❌ Not started — products are entered manually for now |
 | Order-received webhook handling (Meta's native `order` message type) | ❌ Not started — `commerce_flow.py`'s cart is a manual substitute |
 | Payment link generation + gateway webhook (Razorpay) | ❌ Not started — checkout stops at a placeholder message |
@@ -122,7 +123,7 @@ Set the webhook URL in Meta Developer Portal → WhatsApp → Configuration:
 pytest tests/ -v
 ```
 
-98 tests across 9 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, the products/orders/order_items CRUD layer, and the full shop/cart/checkout conversation flow (including cross-tenant isolation and the 10-row list cap). Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
+110 tests across 9 files, covering the webhook/routing/signature-validation infrastructure, multi-tenant isolation, session/history storage, phone normalization, the onboarding form, the products/orders/order_items CRUD layer, the full shop/cart/checkout conversation flow (including cross-tenant isolation and the 10-row list cap), and stock/race-condition hardening — including a genuine two-connection concurrency test (not a sequential simulation) proving two customers racing for the last unit of a product can never both succeed. Requires a real Postgres to run against — `tests/conftest.py` provisions a throwaway one automatically via Docker (testcontainers), or set `TEST_DATABASE_URL` to point at one directly.
 
 ---
 
@@ -172,7 +173,7 @@ whatsapp-commerce-bot/
 │   └── seed.py            # Seed data (default tenant, test tenant)
 ├── reminders/
 │   └── scheduler.py       # Abandoned-cart-nudges placeholder (Phase 6, not implemented)
-└── tests/                 # 98 tests
+└── tests/                 # 110 tests
 ```
 
 See [Spec.md](Spec.md) for the full build spec and phase plan, and [DECISIONS.md](DECISIONS.md) for the architectural rationale carried over from the hospital-booking fork.

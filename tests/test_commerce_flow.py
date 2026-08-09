@@ -42,8 +42,11 @@ def _row_ids(kind_kwargs):
     return {row["id"] for section in kind_kwargs["sections"] for row in section["rows"]}
 
 
-def _make_product(tenant_id, name="Widget", price="199.00", **kwargs):
-    return db.create_product(tenant_id, name=name, price=Decimal(price), **kwargs)
+def _make_product(tenant_id, name="Widget", price="199.00", stock_quantity=100, **kwargs):
+    # Defaults to well-stocked so tests not specifically about stock limits
+    # (create_product's own stock_quantity default is 0) don't trip the
+    # add-to-cart stock check added by the hardening pass.
+    return db.create_product(tenant_id, name=name, price=Decimal(price), stock_quantity=stock_quantity, **kwargs)
 
 
 @pytest.fixture
@@ -303,4 +306,127 @@ async def test_reset_keyword_works_from_cart_with_items(wa, sessions, tenant_id)
     assert sessions.get(tenant_id, PHONE)["state"] == "IDLE"
     # No order was ever created -- reset abandons the cart rather than
     # silently checking out.
+    assert db.get_orders_for_phone(tenant_id, PHONE) == []
+
+
+# --- Hardening: stock checks, race safety, duplicate checkout, unavailable items ---
+
+@pytest.mark.asyncio
+async def test_add_to_cart_blocks_over_quantity(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=1)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))  # 1st unit -> fine
+    assert sessions.get(tenant_id, PHONE)["context"]["cart"] == {str(widget.id): 1}
+
+    # Second add attempts quantity 2, but only 1 is in stock.
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("continue_shopping"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+
+    assert wa.sent[-2] == ("text", {"to": PHONE, "text": "Sorry, only 1 left in stock."})
+    # Cart is untouched -- still just the 1 unit from before.
+    assert sessions.get(tenant_id, PHONE)["context"]["cart"] == {str(widget.id): 1}
+
+
+@pytest.mark.asyncio
+async def test_add_to_cart_out_of_stock_message(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=0)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+
+    assert wa.sent[-2] == ("text", {"to": PHONE, "text": "Sorry, this item is out of stock."})
+    assert sessions.get(tenant_id, PHONE)["context"].get("cart", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_checkout_decrements_stock(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=5)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    assert db.get_product(tenant_id, widget.id).stock_quantity == 4
+
+
+@pytest.mark.asyncio
+async def test_duplicate_checkout_tap_does_not_create_two_orders(wa, sessions, tenant_id):
+    """Simulates a double-tap / webhook redelivery: the same "checkout" reply
+    processed twice in a row against the same session. The cart-clear-before-
+    DB-write in _checkout() means the second tap lands in IDLE (session
+    already reset), not a second checkout."""
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=5)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    assert sessions.get(tenant_id, PHONE)["state"] == "CART"
+
+    checkout_tap = tap("checkout")
+    await handle_incoming(wa, sessions, PHONE, tenant_id, checkout_tap)
+    await handle_incoming(wa, sessions, PHONE, tenant_id, checkout_tap)  # duplicate delivery
+
+    orders = db.get_orders_for_phone(tenant_id, PHONE)
+    assert len(orders) == 1
+    assert db.get_product(tenant_id, widget.id).stock_quantity == 4  # decremented once, not twice
+
+
+@pytest.mark.asyncio
+async def test_checkout_gracefully_drops_item_that_went_out_of_stock(wa, sessions, tenant_id):
+    """A product goes out of stock (e.g. another customer bought the last
+    unit) between being added to this customer's cart and checkout -- it
+    must be dropped from the order with a clear message, not crash or get
+    silently ordered."""
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=5)
+    limited = _make_product(tenant_id, name="Limited Gadget", price="50.00", stock_quantity=1)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("continue_shopping"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{limited.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+
+    # "Sells out" from under this customer between add-to-cart and checkout.
+    db.update_product_stock(tenant_id, limited.id, 0)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    confirm_text = wa.sent[-1][1]["text"]
+    assert "Order #" in confirm_text
+    assert "Limited Gadget went out of stock and was removed from your order." in confirm_text
+
+    order = db.get_orders_for_phone(tenant_id, PHONE)[0]
+    items = db.get_order_items(tenant_id, order.id)
+    assert len(items) == 1
+    assert items[0].product_id == widget.id
+    assert order.total == Decimal("100.00")  # only the still-available item is billed
+
+
+@pytest.mark.asyncio
+async def test_checkout_all_items_unavailable_shows_apology_and_creates_no_order(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00", stock_quantity=1)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{widget.id}"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("add_to_cart"))
+
+    db.update_product_stock(tenant_id, widget.id, 0)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("view_cart"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    assert wa.sent[-1] == (
+        "text",
+        {"to": PHONE, "text": "Sorry, the items in your cart are no longer available. Please start shopping again."},
+    )
     assert db.get_orders_for_phone(tenant_id, PHONE) == []

@@ -5,9 +5,11 @@ order-received/payment handlers, so these test the repository layer directly
 rather than through any webhook flow (nothing calls this CRUD from
 core/main.py yet).
 """
+import threading
 from decimal import Decimal
 
 import db.repository as db
+from db.connection import _connect, get_connection, get_database_url
 
 
 def test_create_product_and_get(tenant_id):
@@ -150,3 +152,138 @@ def test_get_order_items_scoped_to_order(tenant_id):
     items_a = db.get_order_items(tenant_id, order_a.id)
     assert len(items_a) == 1
     assert items_a[0].quantity == 1
+
+
+# --- checkout_cart: stock decrement, unavailable items, duplicate-call safety ---
+
+def test_checkout_cart_decrements_stock_and_creates_order(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+
+    order, unavailable = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 2})
+
+    assert unavailable == []
+    assert order is not None
+    assert order.status == db.ORDER_STATUS_PENDING_PAYMENT
+    assert order.subtotal == Decimal("200.00")
+    assert order.total == Decimal("200.00")
+
+    items = db.get_order_items(tenant_id, order.id)
+    assert len(items) == 1
+    assert items[0].quantity == 2
+    assert items[0].unit_price_at_order_time == Decimal("100.00")
+
+    assert db.get_product(tenant_id, product.id).stock_quantity == 3
+
+
+def test_checkout_cart_rejects_over_quantity_leaving_stock_untouched(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=2)
+
+    order, unavailable = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 5})
+
+    assert order is None
+    assert unavailable == [str(product.id)]
+    assert db.get_product(tenant_id, product.id).stock_quantity == 2  # untouched, not driven negative
+
+
+def test_checkout_cart_skips_deactivated_product_but_orders_the_rest(tenant_id):
+    available = db.create_product(tenant_id, name="Available", price=Decimal("50.00"), stock_quantity=5)
+    deactivated = db.create_product(tenant_id, name="Deactivated", price=Decimal("30.00"), stock_quantity=5)
+    conn = get_connection()
+    conn.execute("UPDATE products SET is_active = 0 WHERE id = ?", (deactivated.id,))
+    conn.commit()
+
+    order, unavailable = db.checkout_cart(
+        tenant_id, "919999999999", {str(available.id): 1, str(deactivated.id): 1},
+    )
+
+    assert order is not None
+    assert unavailable == [str(deactivated.id)]
+    items = db.get_order_items(tenant_id, order.id)
+    assert len(items) == 1
+    assert items[0].product_id == available.id
+    assert order.subtotal == Decimal("50.00")
+    # The deactivated product's stock was never touched.
+    assert db.get_product(tenant_id, deactivated.id).stock_quantity == 5
+
+
+def test_checkout_cart_returns_none_when_every_item_unavailable(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("10.00"), stock_quantity=0)
+
+    order, unavailable = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 1})
+
+    assert order is None
+    assert unavailable == [str(product.id)]
+    assert db.get_orders_for_phone(tenant_id, "919999999999") == []
+
+
+def test_checkout_cart_called_twice_with_same_cart_only_fulfills_once(tenant_id):
+    """Simulates a duplicate checkout (double-tap / webhook redelivery) at the
+    repository layer directly: the same cart, checked out twice in a row.
+    The second call must not oversell the last unit."""
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=1)
+    cart = {str(product.id): 1}
+
+    order1, unavailable1 = db.checkout_cart(tenant_id, "919999999999", cart)
+    order2, unavailable2 = db.checkout_cart(tenant_id, "919999999999", cart)
+
+    assert order1 is not None and unavailable1 == []
+    assert order2 is None and unavailable2 == [str(product.id)]
+    assert db.get_product(tenant_id, product.id).stock_quantity == 0
+    assert len(db.get_orders_for_phone(tenant_id, "919999999999")) == 1
+
+
+def test_concurrent_checkouts_for_last_unit_exactly_one_succeeds(tenant_id):
+    """Real concurrency, not a sequential simulation: two separate physical
+    Postgres connections (standing in for two different worker
+    processes/requests) race db.checkout_cart() for the single remaining unit
+    of a product, started as close to simultaneously as threading.Barrier
+    allows. Exactly one must succeed; the other must cleanly report the item
+    unavailable -- never a negative stock count, never two orders for one
+    unit. This is what actually prevents overselling across two *different*
+    customers -- core/main.py's per-(tenant, phone) message lock doesn't
+    apply here since it's scoped per phone number, not per product."""
+    product = db.create_product(tenant_id, name="Limited Widget", price=Decimal("999.00"), stock_quantity=1)
+    cart = {str(product.id): 1}
+
+    dsn = get_database_url()
+    conn_a = _connect(dsn)
+    conn_b = _connect(dsn)
+    barrier = threading.Barrier(2)
+    results = {}
+    errors = []
+
+    def run(label, conn, phone):
+        try:
+            barrier.wait(timeout=5)
+            results[label] = db.checkout_cart(tenant_id, phone, cart, conn=conn)
+        except Exception as exc:  # surfaced via `errors` so the test fails loudly, not silently
+            errors.append((label, exc))
+
+    thread_a = threading.Thread(target=run, args=("a", conn_a, "911111111111"))
+    thread_b = threading.Thread(target=run, args=("b", conn_b, "922222222222"))
+    thread_a.start()
+    thread_b.start()
+    thread_a.join(timeout=10)
+    thread_b.join(timeout=10)
+    conn_a.close()
+    conn_b.close()
+
+    assert errors == []
+    assert set(results) == {"a", "b"}
+
+    orders = [order for order, _ in results.values()]
+    succeeded = [o for o in orders if o is not None]
+    failed = [o for o in orders if o is None]
+    assert len(succeeded) == 1, f"expected exactly one checkout to succeed, got: {results}"
+    assert len(failed) == 1
+
+    unavailable_from_loser = next(u for o, u in results.values() if o is None)
+    assert unavailable_from_loser == [str(product.id)]
+
+    # Stock never went negative, and exactly one order_item of quantity 1 exists total.
+    assert db.get_product(tenant_id, product.id).stock_quantity == 0
+    winner_phone = "911111111111" if results["a"][0] is not None else "922222222222"
+    winner_order = db.get_orders_for_phone(tenant_id, winner_phone)[0]
+    items = db.get_order_items(tenant_id, winner_order.id)
+    assert len(items) == 1
+    assert items[0].quantity == 1

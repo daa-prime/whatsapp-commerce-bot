@@ -67,3 +67,17 @@ Technical decisions made during development, with rationale.
 **Decision:** `tenants.timezone` defaults to `Asia/Kolkata` if not set explicitly at onboarding.
 
 **Why:** Razorpay — the planned default payment gateway (Spec.md Section 3.3) — targets Indian businesses. A sensible default avoids forcing every onboarding to specify a timezone just to get correct order/invoice timestamp display later.
+
+## Stock decrement as one conditional UPDATE, not SELECT-then-UPDATE
+
+**Decision:** Checkout's stock decrement (`db.checkout_cart()`) is a single `UPDATE products SET stock_quantity = stock_quantity - ? WHERE ... AND stock_quantity >= ?`, not a separate read-then-write.
+
+**Why:** A separate `SELECT stock_quantity` followed by an application-level `if enough: UPDATE` has a race window between the two statements — two concurrent checkouts can both read "1 in stock" before either writes, and both succeed, overselling the last unit. Expressing the check and the write as one statement lets Postgres's row-level locking serialize concurrent attempts on the same row: the second UPDATE to reach a given row always sees the first one's already-decremented value, so its own `stock_quantity >= ?` condition correctly fails if there isn't enough left. Proven under genuine concurrency (two real connections, two OS threads, not a sequential simulation) in `tests/test_products_orders.py::test_concurrent_checkouts_for_last_unit_exactly_one_succeeds`.
+
+**Relation to the hospital repo's double-booking guard:** same architectural idea (a DB-level constraint does the real work, not application logic) as the hospital schema's `UNIQUE INDEX ... WHERE status = 'booked'`, adapted for a different shape of problem — "don't let two inserts collide on an exact value" doesn't apply to "don't let a counter go negative," so this uses a conditional write instead of a uniqueness constraint.
+
+## A real transaction for exactly one call site, not a connection-wide change
+
+**Decision:** `db/connection.py` gained a `transaction()` context manager (autocommit off for its duration, explicit commit/rollback) used by `db.checkout_cart()` alone. Every other repository function keeps using the connection's default per-statement autocommit, completely unaffected.
+
+**Why:** The connection layer has run in autocommit mode since the hospital repo's SQLite-to-Postgres migration — every existing repository function already assumes each statement is its own transaction (see that migration's own rationale above). Checkout is the first call site that genuinely needs several statements (stock decrement, order insert, order_items inserts) to succeed or fail together — if the process crashed between decrementing stock and creating the order, autocommit would leave stock permanently decremented with no order to show for it. Rather than flipping the whole connection to manual-transaction mode (which would force every other call site to start managing commits explicitly, a much bigger change for one call site's need), `transaction()` is scoped to a `with` block and restores autocommit on exit either way.

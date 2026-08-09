@@ -82,6 +82,36 @@ class _PGConnection:
     def close(self) -> None:
         self._conn.close()
 
+    def transaction(self) -> "_Transaction":
+        """Context manager for a real multi-statement transaction, for the
+        rare call site (db/repository.py:checkout_cart) that needs several
+        statements to succeed or fail together -- e.g. decrementing stock and
+        creating an order must not leave one done without the other if
+        something fails partway through. Every other call site in this
+        codebase keeps using the default per-statement autocommit above,
+        completely unaffected: this only changes behavior for the duration of
+        the `with` block, on whichever connection it's called on."""
+        return _Transaction(self._conn)
+
+
+class _Transaction:
+    def __init__(self, conn):
+        self._conn = conn
+
+    def __enter__(self) -> "_Transaction":
+        self._conn.autocommit = False
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.autocommit = True
+        return False  # never suppress an exception raised inside the block
+
 
 _connection: _PGConnection | None = None
 

@@ -387,3 +387,79 @@ def create_order_item(
     new_id = cur.fetchone()["id"]
     conn.commit()
     return get_order_item(tenant_id, new_id)
+
+
+def checkout_cart(
+    tenant_id: int,
+    customer_phone: str,
+    cart: dict[str, int],
+    conn=None,
+) -> tuple[Order | None, list[str]]:
+    """Atomically checks stock, decrements it, and creates the order +
+    order_items for a customer's cart in a single DB transaction (core/
+    commerce_flow.py's checkout step) -- so a crash or error partway through
+    never leaves stock decremented without a matching order, or vice versa.
+
+    Race safety: each product's stock decrement is one conditional UPDATE
+    (`stock_quantity = stock_quantity - ? WHERE stock_quantity >= ?`), not a
+    separate SELECT-then-UPDATE -- Postgres serializes concurrent UPDATEs to
+    the same row at the row-lock level, so two checkouts racing for the last
+    unit can never both succeed. This is a DB-level guard, the same
+    architectural idea as the hospital repo's UNIQUE INDEX double-booking
+    guard, just expressed as a conditional write instead of a conflicting
+    insert (there's no natural uniqueness constraint for "don't oversell a
+    counter" the way there was for "don't double-book an exact timestamp").
+
+    cart: {str(product_id): quantity}, same shape core/commerce_flow.py's
+    session context stores it in.
+
+    conn: optional explicit connection (rather than get_connection()) so
+    tests can drive two genuinely concurrent checkouts against the same
+    database from two separate physical connections -- same reason the old
+    hospital repo's generate_slots_for_doctor() took one.
+
+    Returns (order, unavailable_product_ids). `order` is None if every item
+    in the cart turned out unavailable (out of stock, deactivated, or
+    deleted since being added) -- nothing was created. `unavailable_product_ids`
+    lists which cart entries were dropped, present or not, so the caller can
+    tell the customer what got left out."""
+    conn = conn or get_connection()
+    unavailable: list[str] = []
+    line_items: list[tuple[int, int, Decimal]] = []  # (product_id, quantity, unit_price)
+
+    with conn.transaction():
+        for product_id_str, quantity in cart.items():
+            product_id = int(product_id_str)
+            row = conn.execute(
+                "UPDATE products SET stock_quantity = stock_quantity - ? "
+                "WHERE tenant_id = ? AND id = ? AND is_active = 1 AND stock_quantity >= ? "
+                "RETURNING price",
+                (quantity, tenant_id, product_id, quantity),
+            ).fetchone()
+            if row is None:
+                unavailable.append(product_id_str)
+                continue
+            line_items.append((product_id, quantity, row["price"]))
+
+        if not line_items:
+            return None, unavailable
+
+        subtotal = sum((price * qty for _, qty, price in line_items), Decimal("0"))
+        order_row = conn.execute(
+            "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total) "
+            "VALUES (?, ?, ?, ?, ?) RETURNING id",
+            (tenant_id, customer_phone, ORDER_STATUS_PENDING_PAYMENT, subtotal, subtotal),
+        ).fetchone()
+        order_id = order_row["id"]
+
+        for product_id, quantity, unit_price in line_items:
+            conn.execute(
+                "INSERT INTO order_items (tenant_id, order_id, product_id, quantity, unit_price_at_order_time) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (tenant_id, order_id, product_id, quantity, unit_price),
+            )
+
+    row = conn.execute(
+        "SELECT * FROM orders WHERE tenant_id = ? AND id = ?", (tenant_id, order_id),
+    ).fetchone()
+    return _row_to_order(row), unavailable

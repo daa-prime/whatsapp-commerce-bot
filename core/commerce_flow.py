@@ -146,6 +146,11 @@ def _parse_order_row_id(row_id: str) -> int | None:
         return None
 
 
+def _product_name(tenant_id: int, product_id: int) -> str:
+    product = db.get_product(tenant_id, product_id)
+    return product.name if product else f"Product #{product_id}"
+
+
 def _cart_subtotal(tenant_id: int, cart: dict) -> Decimal:
     """Cart totals shown while shopping reflect *current* product prices
     (unlike an already-checked-out order's line items, which snapshot the
@@ -308,8 +313,7 @@ async def _send_order_detail(wa: WhatsAppClient, phone: str, tenant_id: int, ord
     items = db.get_order_items(tenant_id, order.id)
     lines = []
     for item in items:
-        product = db.get_product(tenant_id, item.product_id)
-        name = product.name if product else f"Product #{item.product_id}"
+        name = _product_name(tenant_id, item.product_id)
         lines.append(f"{item.quantity} x {name} — {_fmt_money(item.unit_price_at_order_time * item.quantity)}")
 
     body = (
@@ -430,9 +434,24 @@ async def _handle_product_detail(wa: WhatsAppClient, sessions, phone: str, tenan
                 await wa.send_text(phone, "Sorry, that item is no longer available.")
                 await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
                 return
+
             cart = dict(context.get("cart", {}))
             key = str(product.id)
-            cart[key] = cart.get(key, 0) + 1
+            requested_qty = cart.get(key, 0) + 1
+            # Advisory check only -- adding to cart doesn't reserve stock, so
+            # this can still race with another customer between now and
+            # checkout. The actual enforcement that can never be raced past
+            # is db.checkout_cart()'s atomic conditional UPDATE, below.
+            if requested_qty > product.stock_quantity:
+                sessions.set(tenant_id, phone, STATE_PRODUCT_DETAIL, context)
+                if product.stock_quantity <= 0:
+                    await wa.send_text(phone, "Sorry, this item is out of stock.")
+                else:
+                    await wa.send_text(phone, f"Sorry, only {product.stock_quantity} left in stock.")
+                await _send_product_detail(wa, phone, product)
+                return
+
+            cart[key] = requested_qty
             new_context = {**context, "cart": cart}
             sessions.set(tenant_id, phone, STATE_POST_ADD, new_context)
             await _send_add_to_cart_prompt(wa, phone, product.name, cart, tenant_id)
@@ -492,41 +511,52 @@ async def _handle_cart(wa: WhatsAppClient, sessions, phone: str, tenant_id: int,
 
 async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict) -> None:
     """Creates a real orders row (ORDER_STATUS_PENDING_PAYMENT) + order_items
-    from the cart, then stubs the payment step -- SPEC.md Section 3.3's
-    Razorpay payment-link generation is the next build, not done here."""
+    from the cart, decrementing stock atomically, then stubs the payment step
+    -- SPEC.md Section 3.3's Razorpay payment-link generation is the next
+    build, not done here.
+
+    Duplicate-checkout protection: the cart is cleared (sessions.reset) here,
+    before the DB write, not after. This composes with two things: (1)
+    core/main.py's per-(tenant, phone) message lock, which already prevents
+    two genuinely concurrent webhook deliveries for the *same* customer from
+    both reaching this function at once, and (2) the fact that once the
+    session leaves STATE_CART, a second "checkout" tap doesn't route back
+    here at all -- it lands in _handle_idle instead. So a double-tap or a
+    webhook redelivery for the same customer can trigger this function at
+    most once with a given cart. Overselling *across different customers*
+    racing for the same product is a separate problem this doesn't solve --
+    that's what db.checkout_cart()'s atomic stock decrement is for."""
     if not cart:
         sessions.reset(tenant_id, phone)
         await wa.send_text(phone, "Your cart is empty. Send any message to start shopping again.")
         return
 
-    line_items: list[tuple[db.Product, int]] = []
-    subtotal = Decimal("0")
-    for product_id_str, qty in cart.items():
-        product = db.get_product(tenant_id, int(product_id_str))
-        if not product or not product.is_active:
-            continue  # dropped between add-to-cart and checkout -- skip rather than fail the whole order
-        line_items.append((product, qty))
-        subtotal += product.price * qty
+    sessions.reset(tenant_id, phone)
 
-    if not line_items:
-        sessions.reset(tenant_id, phone)
-        await wa.send_text(phone, "Sorry, the items in your cart are no longer available. Please start shopping again.")
+    order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart)
+
+    if order is None:
+        await wa.send_text(
+            phone,
+            "Sorry, the items in your cart are no longer available. Please start shopping again.",
+        )
         return
 
-    order = db.create_order(
-        tenant_id, customer_phone=phone, status=db.ORDER_STATUS_PENDING_PAYMENT,
-        subtotal=subtotal, total=subtotal,  # no tax/shipping logic yet (SPEC.md Section 3.2)
+    items = db.get_order_items(tenant_id, order.id)
+    lines = "\n".join(
+        f"{item.quantity} x {_product_name(tenant_id, item.product_id)} — "
+        f"{_fmt_money(item.unit_price_at_order_time * item.quantity)}"
+        for item in items
     )
-    for product, qty in line_items:
-        db.create_order_item(tenant_id, order.id, product.id, quantity=qty, unit_price_at_order_time=product.price)
+    message = f"Order #{order.id} placed!\n\n{lines}\n\nTotal: {_fmt_money(order.total)}"
 
-    lines = "\n".join(f"{qty} x {product.name} — {_fmt_money(product.price * qty)}" for product, qty in line_items)
-    await wa.send_text(
-        phone,
-        f"Order #{order.id} placed!\n\n{lines}\n\nTotal: {_fmt_money(subtotal)}\n\n"
-        "Payment integration coming next — we'll follow up with a payment link shortly.",
-    )
-    sessions.reset(tenant_id, phone)
+    if unavailable_ids:
+        dropped_names = [_product_name(tenant_id, int(pid)) for pid in unavailable_ids]
+        verb = "was" if len(dropped_names) == 1 else "were"
+        message += f"\n\nNote: {', '.join(dropped_names)} went out of stock and {verb} removed from your order."
+
+    message += "\n\nPayment integration coming next — we'll follow up with a payment link shortly."
+    await wa.send_text(phone, message)
 
 
 async def _handle_order_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
