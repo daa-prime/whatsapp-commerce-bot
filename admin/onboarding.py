@@ -16,10 +16,19 @@ deployed instance, not a full auth system.
 
 Phase 0 (SPEC.md Section 8): this only carries over the tenant-identity/Meta-
 credential/data-connection-tier fields from the hospital repo's wizard — the
-hospital-specific "departments and doctors" step is gone. Catalog/payment-
-gateway fields (meta_catalog_id, payment_gateway_provider/api_key_ref —
-SPEC.md Section 7, Phase 7 of the build) aren't collected through this form
-yet; until Phase 7 adds them here, those columns are set manually.
+hospital-specific "departments and doctors" step is gone.
+
+Phase 7 (SPEC.md Section 7): the create form now also collects catalog/
+payment-gateway fields (meta_catalog_id, payment_gateway_provider/
+api_key_ref) as optional fields, since a tenant frequently won't have these
+set up yet at initial onboarding. A separate /admin/tenant/{id}/catalog-payment
+edit step lets an operator add or update them later without re-running the
+whole onboarding form -- submitting that edit form with a field left blank
+never overwrites the existing value (db.update_tenant_catalog_and_payment's
+COALESCE semantics), unlike the create form where blank simply means "don't
+set" (there's nothing to preserve yet on a brand-new tenant). No payment
+gateway *integration* logic reads these fields yet -- Phase 1 (catalog) and
+Phase 3 (payment) are what will eventually act on them.
 """
 import os
 
@@ -34,6 +43,7 @@ router = APIRouter()
 ADMIN_SECRET = os.environ.get("ADMIN_SECRET", "")
 
 _VALID_TIERS = {"tier1", "tier2", "tier3"}
+_VALID_PAYMENT_PROVIDERS = {"razorpay"}  # blank ("not set up yet" / "keep current") is always allowed separately
 
 _PAGE_STYLE = """
 <style>
@@ -88,6 +98,9 @@ def _form_html(errors: list[str] | None = None, values: dict | None = None) -> s
 
     def checked(key: str, option: str, default: str) -> str:
         return "checked" if v.get(key, default) == option else ""
+
+    def selected(key: str, option: str, default: str) -> str:
+        return "selected" if v.get(key, default) == option else ""
 
     error_html = ""
     if errors:
@@ -147,11 +160,24 @@ def _form_html(errors: list[str] | None = None, values: dict | None = None) -> s
       </p>
     </fieldset>
 
-    <p class="hint">
-      Catalog and payment gateway setup (Meta Commerce Manager catalog ID, Razorpay
-      keys) aren't collected here yet — that's added once Phase 1/3's catalog and
-      payment integration are live.
-    </p>
+    <fieldset>
+      <legend>Catalog &amp; payment gateway (optional)</legend>
+      <label>Meta Catalog ID</label>
+      <input type="text" name="meta_catalog_id" value="{esc('meta_catalog_id')}">
+      <p class="hint">From Meta Commerce Manager, once the catalog is linked.
+        Leave blank if you haven't set this up yet — you can add it later.</p>
+
+      <label>Payment gateway provider</label>
+      <select name="payment_gateway_provider">
+        <option value="" {selected('payment_gateway_provider', '', 'razorpay')}>Not set up yet</option>
+        <option value="razorpay" {selected('payment_gateway_provider', 'razorpay', 'razorpay')}>Razorpay</option>
+      </select>
+
+      <label>Payment gateway API key</label>
+      <input type="password" name="payment_gateway_api_key_ref" value="{esc('payment_gateway_api_key_ref')}">
+      <p class="hint">Leave blank if you haven't set this up yet — you can add it later.
+        No payment integration runs against this yet; it's just stored for when it does.</p>
+    </fieldset>
 
     <button type="submit">Create tenant</button>
   </form>
@@ -178,6 +204,10 @@ def _confirmation_html(tenant) -> str:
     <strong>{tenant.id}</strong> (phone_number_id: {html.escape(tenant.whatsapp_phone_number_id)}).
   </div>
   <p>{html.escape(tier_note)}</p>
+  <p>
+    Meta Catalog ID: {html.escape(tenant.meta_catalog_id) if tenant.meta_catalog_id else "<em>not set yet</em>"}<br>
+    Payment gateway: {html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "<em>not set yet</em>"}
+  </p>
   <p class="hint">
     Reminder: this only recorded the credentials you entered — the business's own
     Meta Business/WhatsApp number verification and System User access token must
@@ -185,7 +215,10 @@ def _confirmation_html(tenant) -> str:
     outbound messages and webhook signature validation for this tenant will fail
     until it is.
   </p>
-  <p><a href="/admin/onboard-tenant">Onboard another tenant</a></p>
+  <p>
+    <a href="/admin/onboard-tenant">Onboard another tenant</a> ·
+    <a href="/admin/tenant/{tenant.id}/catalog-payment">Add catalog/payment details later</a>
+  </p>
 </body>
 </html>"""
 
@@ -207,6 +240,9 @@ async def onboard_tenant_submit(
     data_tier: str = Form("tier1"),
     api_base_url: str = Form(""),
     api_key: str = Form(""),
+    meta_catalog_id: str = Form(""),
+    payment_gateway_provider: str = Form(""),
+    payment_gateway_api_key_ref: str = Form(""),
 ):
     values = {
         "admin_secret": admin_secret,
@@ -219,6 +255,9 @@ async def onboard_tenant_submit(
         "data_tier": data_tier,
         "api_base_url": api_base_url,
         "api_key": api_key,
+        "meta_catalog_id": meta_catalog_id,
+        "payment_gateway_provider": payment_gateway_provider,
+        "payment_gateway_api_key_ref": payment_gateway_api_key_ref,
     }
 
     if admin_secret != ADMIN_SECRET:
@@ -236,6 +275,9 @@ async def onboard_tenant_submit(
         errors.append(f'Unrecognized data connection tier "{data_tier}".')
     elif data_tier == "tier2" and not (api_base_url.strip() and api_key.strip()):
         errors.append('"Connect my existing system\'s API" requires both an API base URL and an API key.')
+
+    if payment_gateway_provider and payment_gateway_provider not in _VALID_PAYMENT_PROVIDERS:
+        errors.append(f'Unrecognized payment gateway provider "{payment_gateway_provider}".')
 
     if errors:
         return HTMLResponse(_form_html(errors, values), status_code=400)
@@ -256,6 +298,9 @@ async def onboard_tenant_submit(
             data_tier=data_tier,
             external_api_base_url=stored_api_base_url,
             external_api_key=stored_api_key,
+            meta_catalog_id=meta_catalog_id.strip() or None,
+            payment_gateway_provider=payment_gateway_provider.strip() or None,
+            payment_gateway_api_key_ref=payment_gateway_api_key_ref.strip() or None,
         )
     except IntegrityError:
         errors.append(
@@ -265,3 +310,127 @@ async def onboard_tenant_submit(
         return HTMLResponse(_form_html(errors, values), status_code=400)
 
     return _confirmation_html(tenant)
+
+
+# --- Catalog / payment gateway edit step (SPEC.md Section 7, Phase 7) ---
+# Separate from the create form above: a tenant frequently won't have its
+# catalog/payment gateway set up at initial onboarding time, so this lets an
+# operator add or update those fields later. Unlike the create form, blank
+# fields here mean "keep the current value" (db.update_tenant_catalog_and_payment's
+# COALESCE semantics), not "unset" -- there's something to preserve now.
+
+def _catalog_payment_form_html(tenant, errors: list[str] | None = None, values: dict | None = None) -> str:
+    import html
+    v = values or {}
+
+    def esc(key: str) -> str:
+        return html.escape(str(v.get(key, "")))
+
+    def selected(key: str, option: str) -> str:
+        return "selected" if v.get(key, "") == option else ""
+
+    error_html = ""
+    if errors:
+        items = "".join(f"<li>{html.escape(e)}</li>" for e in errors)
+        error_html = f'<div class="error"><strong>Please fix the following:</strong><ul>{items}</ul></div>'
+
+    catalog_current = html.escape(tenant.meta_catalog_id) if tenant.meta_catalog_id else "not set"
+    provider_current = html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "not set"
+    key_current = "set" if tenant.payment_gateway_api_key_ref else "not set"
+
+    return f"""<!doctype html>
+<html>
+<head><title>Catalog &amp; payment — {html.escape(tenant.name)}</title>{_PAGE_STYLE}</head>
+<body>
+  <h1>Catalog &amp; payment gateway — {html.escape(tenant.name)}</h1>
+  {error_html}
+  <form method="post" action="/admin/tenant/{tenant.id}/catalog-payment">
+    <label>Admin secret</label>
+    <input type="password" name="admin_secret" value="{esc('admin_secret')}" required>
+
+    <label>Meta Catalog ID</label>
+    <input type="text" name="meta_catalog_id" value="{esc('meta_catalog_id')}" placeholder="Currently: {catalog_current}">
+    <p class="hint">Currently: {catalog_current}. Leave blank to keep it as-is —
+      leave blank if you haven't set this up yet — you can add it later.</p>
+
+    <label>Payment gateway provider</label>
+    <select name="payment_gateway_provider">
+      <option value="" {selected('payment_gateway_provider', '')}>Keep current ({provider_current})</option>
+      <option value="razorpay" {selected('payment_gateway_provider', 'razorpay')}>Razorpay</option>
+    </select>
+
+    <label>Payment gateway API key</label>
+    <input type="password" name="payment_gateway_api_key_ref" value="{esc('payment_gateway_api_key_ref')}">
+    <p class="hint">Currently: {key_current}. Leave blank to keep the current key —
+      leave blank if you haven't set this up yet — you can add it later.</p>
+
+    <button type="submit">Save</button>
+  </form>
+</body>
+</html>"""
+
+
+def _catalog_payment_confirmation_html(tenant) -> str:
+    import html
+    return f"""<!doctype html>
+<html>
+<head><title>Catalog &amp; payment updated</title>{_PAGE_STYLE}</head>
+<body>
+  <h1>Catalog &amp; payment gateway updated</h1>
+  <div class="ok"><strong>{html.escape(tenant.name)}</strong>'s catalog/payment settings were updated.</div>
+  <p>
+    Meta Catalog ID: {html.escape(tenant.meta_catalog_id) if tenant.meta_catalog_id else "<em>not set</em>"}<br>
+    Payment gateway provider: {html.escape(tenant.payment_gateway_provider) if tenant.payment_gateway_provider else "<em>not set</em>"}<br>
+    Payment gateway API key: {"<em>set</em>" if tenant.payment_gateway_api_key_ref else "<em>not set</em>"}
+  </p>
+  <p><a href="/admin/tenant/{tenant.id}/catalog-payment">Edit again</a></p>
+</body>
+</html>"""
+
+
+@router.get("/admin/tenant/{tenant_id}/catalog-payment", response_class=HTMLResponse)
+async def edit_tenant_catalog_payment_form(tenant_id: int):
+    tenant = db.get_tenant(tenant_id)
+    if tenant is None:
+        return HTMLResponse("<p>Tenant not found.</p>", status_code=404)
+    return _catalog_payment_form_html(tenant)
+
+
+@router.post("/admin/tenant/{tenant_id}/catalog-payment", response_class=HTMLResponse)
+async def edit_tenant_catalog_payment_submit(
+    tenant_id: int,
+    admin_secret: str = Form(""),
+    meta_catalog_id: str = Form(""),
+    payment_gateway_provider: str = Form(""),
+    payment_gateway_api_key_ref: str = Form(""),
+):
+    tenant = db.get_tenant(tenant_id)
+    if tenant is None:
+        return HTMLResponse("<p>Tenant not found.</p>", status_code=404)
+
+    values = {
+        "admin_secret": admin_secret,
+        "meta_catalog_id": meta_catalog_id,
+        "payment_gateway_provider": payment_gateway_provider,
+        "payment_gateway_api_key_ref": payment_gateway_api_key_ref,
+    }
+
+    if admin_secret != ADMIN_SECRET:
+        return HTMLResponse(_catalog_payment_form_html(tenant, ["Incorrect admin secret."], values), status_code=403)
+
+    if payment_gateway_provider and payment_gateway_provider not in _VALID_PAYMENT_PROVIDERS:
+        return HTMLResponse(
+            _catalog_payment_form_html(
+                tenant, [f'Unrecognized payment gateway provider "{payment_gateway_provider}".'], values,
+            ),
+            status_code=400,
+        )
+
+    db.update_tenant_catalog_and_payment(
+        tenant_id,
+        meta_catalog_id=meta_catalog_id.strip() or None,
+        payment_gateway_provider=payment_gateway_provider.strip() or None,
+        payment_gateway_api_key_ref=payment_gateway_api_key_ref.strip() or None,
+    )
+
+    return _catalog_payment_confirmation_html(db.get_tenant(tenant_id))

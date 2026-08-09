@@ -174,3 +174,164 @@ def test_missing_admin_secret_rejected(tenant_id):
     del form["admin_secret"]
     resp = client.post("/admin/onboard-tenant", data=form)
     assert resp.status_code == 403
+
+
+# --- Catalog / payment gateway fields (SPEC.md Section 7, Phase 7) ---
+
+def test_catalog_and_payment_fields_save_correctly_at_create(tenant_id):
+    form = dict(
+        VALID_FORM,
+        meta_catalog_id="1234567890",
+        payment_gateway_provider="razorpay",
+        payment_gateway_api_key_ref="rzp_test_abc123",
+    )
+    resp = client.post("/admin/onboard-tenant", data=form)
+    assert resp.status_code == 200
+
+    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
+    assert tenant.meta_catalog_id == "1234567890"
+    assert tenant.payment_gateway_provider == "razorpay"
+    assert tenant.payment_gateway_api_key_ref == "rzp_test_abc123"
+
+
+def test_catalog_and_payment_fields_optional_at_create(tenant_id):
+    """A tenant frequently won't have catalog/payment set up yet at initial
+    onboarding -- leaving these blank must succeed, not be treated as a
+    validation error."""
+    resp = client.post("/admin/onboard-tenant", data=VALID_FORM)  # VALID_FORM has none of these fields
+    assert resp.status_code == 200
+
+    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
+    assert tenant.meta_catalog_id is None
+    assert tenant.payment_gateway_provider is None
+    assert tenant.payment_gateway_api_key_ref is None
+
+
+def test_invalid_payment_gateway_provider_rejected_at_create(tenant_id):
+    form = dict(VALID_FORM, payment_gateway_provider="stripe")  # not a supported provider yet
+    resp = client.post("/admin/onboard-tenant", data=form)
+    assert resp.status_code == 400
+    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
+
+
+def test_catalog_payment_edit_form_renders_with_current_values(tenant_id):
+    resp = client.get(f"/admin/tenant/{tenant_id}/catalog-payment")
+    assert resp.status_code == 200
+    assert "not set" in resp.text.lower()  # nothing set yet on the seeded tenant
+
+
+def test_catalog_payment_edit_form_404s_for_unknown_tenant():
+    resp = client.get("/admin/tenant/999999/catalog-payment")
+    assert resp.status_code == 404
+
+
+def test_catalog_payment_edit_saves_new_values(tenant_id):
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "999888777",
+        "payment_gateway_provider": "razorpay",
+        "payment_gateway_api_key_ref": "rzp_live_xyz",
+    })
+    assert resp.status_code == 200
+    assert "updated" in resp.text.lower()
+
+    tenant = db.get_tenant(tenant_id)
+    assert tenant.meta_catalog_id == "999888777"
+    assert tenant.payment_gateway_provider == "razorpay"
+    assert tenant.payment_gateway_api_key_ref == "rzp_live_xyz"
+
+
+def test_catalog_payment_edit_blank_fields_do_not_overwrite_existing_values(tenant_id):
+    """The core correctness requirement: submitting the edit form with fields
+    left blank (e.g. because only one of the two is being updated right now)
+    must never clobber an already-set value with NULL."""
+    client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "111222333",
+        "payment_gateway_provider": "razorpay",
+        "payment_gateway_api_key_ref": "rzp_original_key",
+    })
+
+    # Second edit only updates the catalog ID, leaving payment fields blank.
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "444555666",
+        "payment_gateway_provider": "",
+        "payment_gateway_api_key_ref": "",
+    })
+    assert resp.status_code == 200
+
+    tenant = db.get_tenant(tenant_id)
+    assert tenant.meta_catalog_id == "444555666"  # updated
+    assert tenant.payment_gateway_provider == "razorpay"  # preserved, not blanked
+    assert tenant.payment_gateway_api_key_ref == "rzp_original_key"  # preserved, not blanked
+
+
+def test_catalog_payment_edit_all_blank_is_a_no_op(tenant_id):
+    client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "keep-me",
+        "payment_gateway_provider": "razorpay",
+        "payment_gateway_api_key_ref": "keep-this-key",
+    })
+
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "",
+        "payment_gateway_provider": "",
+        "payment_gateway_api_key_ref": "",
+    })
+    assert resp.status_code == 200
+
+    tenant = db.get_tenant(tenant_id)
+    assert tenant.meta_catalog_id == "keep-me"
+    assert tenant.payment_gateway_provider == "razorpay"
+    assert tenant.payment_gateway_api_key_ref == "keep-this-key"
+
+
+def test_catalog_payment_edit_wrong_admin_secret_rejected(tenant_id):
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "wrong-secret",
+        "meta_catalog_id": "should-not-save",
+    })
+    assert resp.status_code == 403
+    assert db.get_tenant(tenant_id).meta_catalog_id is None
+
+
+def test_catalog_payment_edit_invalid_provider_rejected(tenant_id):
+    resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "payment_gateway_provider": "stripe",
+    })
+    assert resp.status_code == 400
+    assert db.get_tenant(tenant_id).payment_gateway_provider is None
+
+
+def test_catalog_payment_edit_isolated_across_tenants(tenant_id, second_tenant_id):
+    """Editing one tenant's catalog/payment fields must never touch another
+    tenant's row."""
+    client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "tenant-a-catalog",
+        "payment_gateway_provider": "razorpay",
+        "payment_gateway_api_key_ref": "tenant-a-key",
+    })
+
+    other = db.get_tenant(second_tenant_id)
+    assert other.meta_catalog_id is None
+    assert other.payment_gateway_provider is None
+    assert other.payment_gateway_api_key_ref is None
+
+    client.post(f"/admin/tenant/{second_tenant_id}/catalog-payment", data={
+        "admin_secret": "test-admin-secret",
+        "meta_catalog_id": "tenant-b-catalog",
+        "payment_gateway_provider": "razorpay",
+        "payment_gateway_api_key_ref": "tenant-b-key",
+    })
+
+    mine = db.get_tenant(tenant_id)
+    theirs = db.get_tenant(second_tenant_id)
+    assert mine.meta_catalog_id == "tenant-a-catalog"
+    assert mine.payment_gateway_api_key_ref == "tenant-a-key"
+    assert theirs.meta_catalog_id == "tenant-b-catalog"
+    assert theirs.payment_gateway_api_key_ref == "tenant-b-key"

@@ -128,6 +128,34 @@ def create_tenant(
     return get_tenant(new_id)
 
 
+def update_tenant_catalog_and_payment(
+    tenant_id: int,
+    meta_catalog_id: str | None = None,
+    payment_gateway_provider: str | None = None,
+    payment_gateway_api_key_ref: str | None = None,
+) -> None:
+    """Onboarding wizard's catalog/payment-gateway edit step (SPEC.md Section
+    7, Phase 7) -- no integration logic reads these fields yet, this just
+    captures and stores the data for when Phase 1 (catalog) and Phase 3
+    (payment) are built.
+
+    Each field is only overwritten when a caller actually passes a value --
+    COALESCE keeps whatever was already stored otherwise (same convention as
+    update_order_status), so submitting the edit form with a field left
+    blank (e.g. because it isn't set up yet) never clobbers an existing
+    catalog ID or payment key with NULL."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE tenants SET "
+        "meta_catalog_id = COALESCE(?, meta_catalog_id), "
+        "payment_gateway_provider = COALESCE(?, payment_gateway_provider), "
+        "payment_gateway_api_key_ref = COALESCE(?, payment_gateway_api_key_ref) "
+        "WHERE id = ?",
+        (meta_catalog_id, payment_gateway_provider, payment_gateway_api_key_ref, tenant_id),
+    )
+    conn.commit()
+
+
 # --- Products (SPEC.md Section 4, mirrors Meta's catalog for pricing/stock lookups) ---
 
 @dataclass
