@@ -52,7 +52,11 @@ class _PGConnection:
     running db/schema.sql's multi-statement script in one call."""
 
     def __init__(self, dsn: str):
-        self._conn = psycopg2.connect(dsn, cursor_factory=psycopg2.extras.RealDictCursor)
+        self._dsn = dsn
+        self._connect()
+
+    def _connect(self) -> None:
+        self._conn = psycopg2.connect(self._dsn, cursor_factory=psycopg2.extras.RealDictCursor)
         # Critical behavioral difference from SQLite: Postgres aborts the
         # *entire* transaction after any failed statement (e.g. the
         # IntegrityError admin/onboarding.py's duplicate-phone_number_id catch
@@ -67,9 +71,23 @@ class _PGConnection:
         self._conn.autocommit = True
 
     def execute(self, sql: str, params=()):
-        cur = self._conn.cursor()
-        cur.execute(_QUESTION_MARK_RE.sub("%s", sql), params)
-        return cur
+        pg_sql = _QUESTION_MARK_RE.sub("%s", sql)
+        try:
+            cur = self._conn.cursor()
+            cur.execute(pg_sql, params)
+            return cur
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            # The module-level connection is reused for the process lifetime
+            # (see class docstring) -- a managed Postgres provider (e.g. Neon's
+            # pooler) can silently close an idle connection between requests.
+            # One reconnect-and-retry means a process that's been idle for a
+            # while (low-traffic production, or a manual testing session with
+            # gaps between messages) recovers on the next request instead of
+            # every subsequent query failing until the process is restarted.
+            self._connect()
+            cur = self._conn.cursor()
+            cur.execute(pg_sql, params)
+            return cur
 
     def executescript(self, sql: str) -> None:
         cur = self._conn.cursor()

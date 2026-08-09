@@ -27,8 +27,10 @@ class FakeWhatsAppClient:
     async def send_list(self, to, body_text, button_text, sections, header_text=None, footer_text=None):
         self.sent.append(("list", {"to": to, "body_text": body_text, "sections": sections}))
 
-    async def send_buttons(self, to, body_text, buttons, header_text=None, footer_text=None):
-        self.sent.append(("buttons", {"to": to, "body_text": body_text, "buttons": buttons}))
+    async def send_buttons(self, to, body_text, buttons, header_text=None, header_image_url=None, footer_text=None):
+        self.sent.append(("buttons", {
+            "to": to, "body_text": body_text, "buttons": buttons, "header_image_url": header_image_url,
+        }))
 
 
 def tap(option_id, title=""):
@@ -250,6 +252,55 @@ async def test_product_list_respects_ten_row_cap_with_see_more(wa, sessions, ten
     await handle_incoming(wa, sessions, PHONE, tenant_id, tap("shop_more"))
     rows2 = [row for section in wa.sent[-1][1]["sections"] for row in section["rows"]]
     assert {r["id"] for r in rows2} == {f"product_{p.id}" for p in products[9:]}
+
+
+# --- Category grouping + product images ---
+
+@pytest.mark.asyncio
+async def test_product_list_groups_into_sections_by_category(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="10.00", category="Tools")
+    gadget = _make_product(tenant_id, name="Gadget", price="20.00", category="Electronics")
+    gizmo = _make_product(tenant_id, name="Gizmo", price="30.00", category="Tools")
+    uncategorized = _make_product(tenant_id, name="Mystery Item", price="5.00")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    sections = wa.sent[-1][1]["sections"]
+    by_title = {s["title"]: {r["id"] for r in s["rows"]} for s in sections}
+
+    assert by_title["Tools"] == {f"product_{widget.id}", f"product_{gizmo.id}"}
+    assert by_title["Electronics"] == {f"product_{gadget.id}"}
+    assert by_title["Other"] == {f"product_{uncategorized.id}"}
+
+
+@pytest.mark.asyncio
+async def test_product_list_categories_ordered_by_first_appearance(wa, sessions, tenant_id):
+    _make_product(tenant_id, name="A", price="10.00", category="Zebra")
+    _make_product(tenant_id, name="B", price="10.00", category="Apple")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    titles = [s["title"] for s in wa.sent[-1][1]["sections"]]
+    assert titles == ["Zebra", "Apple"]  # not alphabetical -- first-seen order
+
+
+@pytest.mark.asyncio
+async def test_product_detail_sends_image_header_when_set(wa, sessions, tenant_id):
+    product = _make_product(tenant_id, name="Widget", price="10.00", image_url="https://example.com/widget.png")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{product.id}"))
+
+    assert wa.sent[-1][0] == "buttons"
+    assert wa.sent[-1][1]["header_image_url"] == "https://example.com/widget.png"
+
+
+@pytest.mark.asyncio
+async def test_product_detail_no_image_header_when_unset(wa, sessions, tenant_id):
+    product = _make_product(tenant_id, name="Widget", price="10.00")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{product.id}"))
+
+    assert wa.sent[-1][1]["header_image_url"] is None
 
 
 # --- Cross-tenant isolation ---

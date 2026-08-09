@@ -61,6 +61,21 @@ async def test_send_buttons_builds_interactive_button_payload(httpx_mock):
         {"type": "reply", "reply": {"id": "confirm", "title": "Confirm"}},
         {"type": "reply", "reply": {"id": "cancel", "title": "Cancel"}},
     ]
+    assert "header" not in payload["interactive"]
+
+
+@pytest.mark.asyncio
+async def test_send_buttons_with_header_image_url(httpx_mock):
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "msg_id"}]})
+    client = WhatsAppClient(phone_number_id="123", access_token="token")
+    await client.send_buttons(
+        to="54911111111", body_text="Widget", buttons=[{"id": "add", "title": "Add to Cart"}],
+        header_image_url="https://example.com/widget.png", header_text="ignored when image is set",
+    )
+
+    request = httpx_mock.get_requests()[0]
+    payload = json.loads(request.content)
+    assert payload["interactive"]["header"] == {"type": "image", "image": {"link": "https://example.com/widget.png"}}
 
 
 def test_parse_incoming_message_text():

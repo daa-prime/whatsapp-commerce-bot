@@ -111,11 +111,21 @@ class WhatsAppClient:
         body_text: str,
         buttons: list[dict],
         header_text: str | None = None,
+        header_image_url: str | None = None,
         footer_text: str | None = None,
     ) -> None:
         """
         Send a WhatsApp interactive reply-button message (max 3 buttons).
         buttons: [{"id": str, "title": str}], title <=20 chars.
+
+        header_image_url: Meta's button-message header supports exactly one
+        type (text OR image OR video OR document, never combined) -- unlike
+        send_list's header, which is text-only (Meta doesn't support image
+        headers on list messages at all, a hard platform limit, not something
+        this client can work around). header_image_url takes precedence over
+        header_text if both are passed. Meta fetches the image from this URL
+        server-side, so it must be a real, publicly reachable link (e.g.
+        products.image_url) -- no local file upload here.
         """
         to = normalize_phone(to)
         url = f"{WA_API_BASE}/{self._phone_number_id}/messages"
@@ -129,7 +139,9 @@ class WhatsAppClient:
                 ]
             },
         }
-        if header_text:
+        if header_image_url:
+            interactive["header"] = {"type": "image", "image": {"link": header_image_url}}
+        elif header_text:
             interactive["header"] = {"type": "text", "text": header_text}
         if footer_text:
             interactive["footer"] = {"text": footer_text}

@@ -1,0 +1,220 @@
+{% extends "base.html" %}
+{% block title %}ShopTransact — WhatsApp Commerce & Transaction Platform{% endblock %}
+
+{% block head %}
+{% include "_orange_theme.html" %}
+<style>
+  .page { max-width: 1080px; }
+
+  .landing-header { display: flex; align-items: center; margin-bottom: var(--space-8); }
+  .landing-header .brand { margin-bottom: 0; }
+  .landing-mark {
+    width: 40px; height: 40px; border-radius: var(--radius-md); flex: none;
+    background: linear-gradient(135deg, var(--color-primary), var(--color-primary-dark));
+    display: flex; align-items: center; justify-content: center;
+  }
+  .landing-brand-text .brand-name { font-size: 1.2rem; }
+  .landing-tagline { color: var(--color-muted); font-size: 0.82rem; margin-top: 1px; }
+
+  .hero {
+    display: grid;
+    grid-template-columns: 1.15fr 1fr;
+    gap: var(--space-8);
+    align-items: center;
+    margin-bottom: var(--space-8);
+  }
+  @media (max-width: 860px) {
+    .hero { grid-template-columns: 1fr; }
+  }
+
+  .hero h1 {
+    font-size: 2.35rem;
+    line-height: 1.15;
+    margin-bottom: var(--space-4);
+  }
+  .hero .lede {
+    color: var(--color-muted);
+    font-size: 1.05rem;
+    max-width: 46ch;
+    margin-bottom: var(--space-5);
+  }
+  .cta-row { display: flex; gap: var(--space-3); flex-wrap: wrap; align-items: center; }
+  .cta-row .btn { padding: 12px 22px; font-size: 0.95rem; }
+  .secondary-link { margin-top: var(--space-4); }
+
+  .features {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: var(--space-4);
+    margin-bottom: var(--space-8);
+  }
+  @media (max-width: 780px) {
+    .features { grid-template-columns: 1fr; }
+  }
+  .feature-card { text-align: left; }
+  .feature-icon {
+    width: 38px; height: 38px; border-radius: var(--radius-sm);
+    background: var(--color-primary-lighter);
+    color: var(--color-primary);
+    display: flex; align-items: center; justify-content: center;
+    margin-bottom: var(--space-3);
+  }
+  .feature-card h3 { font-size: 1rem; margin: 0 0 var(--space-1); }
+  .feature-card p { color: var(--color-muted); font-size: 0.88rem; margin: 0; }
+
+  /* Phone mockup: shows the actual menu core/commerce_flow.py's
+     _send_main_menu sends -- not an aspirational made-up UI. WhatsApp's own
+     chrome colors (teal header, chat wallpaper tone) are kept authentic
+     rather than reskinned orange -- it's depicting WhatsApp's app, not ours. */
+  .phone-frame {
+    width: 280px;
+    margin: 0 auto;
+    border-radius: 34px;
+    background: #111;
+    padding: 10px;
+    box-shadow: var(--shadow-md);
+  }
+  .phone-screen {
+    background: #ECE5DD;
+    border-radius: 26px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-height: 420px;
+  }
+  .wa-header {
+    background: #075E54;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 14px 14px 10px;
+  }
+  .wa-avatar {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: var(--color-primary);
+    color: #fff; font-weight: 700; font-size: 0.75rem;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .wa-name { font-weight: 600; font-size: 0.9rem; }
+  .wa-status { font-size: 0.72rem; opacity: 0.85; }
+  .wa-body { padding: 14px 10px; flex: 1; display: flex; flex-direction: column; gap: 8px; }
+  .wa-bubble {
+    background: #fff;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 0.8rem;
+    max-width: 88%;
+    box-shadow: 0 1px 1px rgba(0,0,0,0.08);
+  }
+  .wa-list { padding: 4px 0 0; }
+  .wa-list-row {
+    padding: 7px 10px;
+    border-bottom: 1px solid #F0F0F0;
+    color: #222;
+  }
+  .wa-list-row:last-of-type { border-bottom: none; }
+  .wa-list-button {
+    text-align: center;
+    color: #075E54;
+    font-weight: 700;
+    font-size: 0.8rem;
+    padding: 10px;
+    border-top: 1px solid #F0F0F0;
+    margin-top: 2px;
+  }
+  .wa-timestamp { font-size: 0.65rem; color: var(--color-muted); text-align: center; margin-bottom: 2px; }
+</style>
+{% endblock %}
+
+{% block content %}
+
+<header class="landing-header">
+  <div class="brand">
+    <div class="landing-mark">
+      <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="9" cy="21" r="1"></circle>
+        <circle cx="20" cy="21" r="1"></circle>
+        <path d="M1 1h4l2.68 13.39a2 2 0 0 0 2 1.61h9.72a2 2 0 0 0 2-1.61L23 6H6"></path>
+      </svg>
+    </div>
+    <div class="landing-brand-text">
+      <div class="brand-name">ShopTransact</div>
+      <div class="landing-tagline">WhatsApp Commerce &amp; Transaction Platform</div>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div>
+    <h1>Sell on WhatsApp.<br>Managed from one merchant dashboard.</h1>
+    <p class="lede">
+      Let customers browse products, checkout, and pay through WhatsApp.
+      Manage products, orders, and payments from one dashboard.
+    </p>
+    <div class="cta-row">
+      <a href="/admin/onboard-tenant" class="btn btn-primary">Set up your store</a>
+      <a href="mailto:hello@shoptransact.example?subject=Product%20demo%20request" class="btn btn-secondary">Request a product demo</a>
+    </div>
+    <p class="secondary-link"><a href="/portal/login" class="btn-link">Merchant login &rarr;</a></p>
+  </div>
+
+  <div class="phone-frame">
+    <div class="phone-screen">
+      <div class="wa-header">
+        <div class="wa-avatar">SS</div>
+        <div>
+          <div class="wa-name">Sunrise Store</div>
+          <div class="wa-status">WhatsApp Business</div>
+        </div>
+      </div>
+      <div class="wa-body">
+        <div class="wa-timestamp">Today</div>
+        <div class="wa-bubble">Hi! Welcome to Sunrise Store. What would you like to do?</div>
+        <div class="wa-bubble wa-list">
+          <div class="wa-list-row">1. Shop Now</div>
+          <div class="wa-list-row">2. My Orders</div>
+          <div class="wa-list-row">3. Track Order</div>
+          <div class="wa-list-row">4. Offers</div>
+          <div class="wa-list-row">5. Account</div>
+          <div class="wa-list-row">6. Talk to Us</div>
+          <div class="wa-list-button">Main Menu</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="features">
+  <div class="card feature-card">
+    <div class="feature-icon">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="5" y="2" width="14" height="20" rx="2"></rect>
+        <line x1="12" y1="18" x2="12.01" y2="18"></line>
+      </svg>
+    </div>
+    <h3>No app for customers</h3>
+    <p>Works directly on WhatsApp — nothing to download or install.</p>
+  </div>
+  <div class="card feature-card">
+    <div class="feature-icon">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polygon points="3 11 22 2 13 21 11 13 3 11"></polygon>
+      </svg>
+    </div>
+    <h3>Simple &amp; guided</h3>
+    <p>Menu-driven shopping that just works, start to checkout.</p>
+  </div>
+  <div class="card feature-card">
+    <div class="feature-icon">
+      <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20.59 13.41 11 3.83V3H3v8h.83l9.58 9.59a2 2 0 0 0 2.83 0l4.35-4.35a2 2 0 0 0 0-2.83z"></path>
+        <circle cx="6.5" cy="6.5" r="1"></circle>
+      </svg>
+    </div>
+    <h3>Transparent pricing</h3>
+    <p>No platform markup — Meta messaging and Razorpay charges may apply.</p>
+  </div>
+</section>
+
+{% endblock %}

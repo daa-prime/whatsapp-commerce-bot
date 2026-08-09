@@ -191,10 +191,41 @@ def _product_row(product: db.Product) -> dict:
     }
 
 
+def _group_products_by_category(products: list[db.Product]) -> list[tuple[str, list[db.Product]]]:
+    """Groups active products into (category_label, products) pairs, each
+    category's products keeping their original (db.get_active_products, id)
+    order. Categories are ordered by first appearance in that same order --
+    not alphabetically -- so a merchant's catalog order isn't reshuffled just
+    because "Accessories" sorts before "Widgets". Blank/NULL category
+    (products.category is optional, SPEC.md Section 4) becomes "Other" rather
+    than a nameless section."""
+    groups: dict[str, list[db.Product]] = {}
+    order: list[str] = []
+    for p in products:
+        label = (p.category or "").strip() or "Other"
+        if label not in groups:
+            groups[label] = []
+            order.append(label)
+        groups[label].append(p)
+    return [(label, groups[label]) for label in order]
+
+
 async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, offset: int) -> bool:
-    """Sends the product list page starting at `offset`. Returns False (sends
-    nothing) if the tenant has no active products at all -- callers handle
-    that as an empty-catalog case, not an error.
+    """Sends the product list page starting at `offset`, grouped into one
+    WhatsApp list-message section per category (Meta's list messages support
+    multiple named sections natively -- this isn't a workaround, it's the
+    feature that shows a category as a heading in the browse UI). Returns
+    False (sends nothing) if the tenant has no active products at all --
+    callers handle that as an empty-catalog case, not an error.
+
+    `offset` indexes into the flat, category-grouped product order (every
+    category's products consecutive, categories in first-appearance order),
+    not raw db id order -- so paginating keeps a category's products
+    together across "See more" pages rather than splitting one down the
+    middle. Products are then re-grouped into their sections after windowing/
+    capping, using the exact same MAX_LIST_ROWS-row-total math as before
+    grouping was added (see _cap_rows) -- section titles/headers don't count
+    against Meta's 10-row cap, only rows do.
 
     Pagination choice: with more than MAX_LIST_ROWS active products, this
     shows the first (MAX_LIST_ROWS - 1) and a "See more products" row rather
@@ -207,17 +238,28 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
     if not products:
         return False
 
-    window = products[offset:offset + MAX_LIST_ROWS]
-    has_more = offset + MAX_LIST_ROWS < len(products)
-    rows = [_product_row(p) for p in window]
+    grouped = _group_products_by_category(products)
+    flat = [p for _, plist in grouped for p in plist]
+
+    window = flat[offset:offset + MAX_LIST_ROWS]
+    has_more = offset + MAX_LIST_ROWS < len(flat)
     more_row = {"id": SHOP_MORE, "title": "See more products"} if has_more else None
-    rows = _cap_rows(rows, more_row)
+    limit = MAX_LIST_ROWS - 1 if more_row is not None else MAX_LIST_ROWS
+    capped_ids = {p.id for p in window[:limit]}
+
+    sections = []
+    for label, plist in grouped:
+        rows = [_product_row(p) for p in plist if p.id in capped_ids]
+        if rows:
+            sections.append({"title": label[:24], "rows": rows})
+    if more_row is not None:
+        sections.append({"title": "More", "rows": [more_row]})
 
     await wa.send_list(
         to=phone,
         body_text="Browse our products:",
         button_text="View Products",
-        sections=[{"title": "Products", "rows": rows}],
+        sections=sections,
     )
     return True
 
@@ -229,6 +271,7 @@ async def _send_product_detail(wa: WhatsAppClient, phone: str, product: db.Produ
     await wa.send_buttons(
         to=phone,
         body_text=body,
+        header_image_url=product.image_url or None,
         buttons=[
             {"id": ADD_TO_CART, "title": "Add to Cart"},
             {"id": BACK_TO_PRODUCTS, "title": "Back to Products"},

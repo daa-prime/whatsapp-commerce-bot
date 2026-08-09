@@ -1,0 +1,22 @@
+<style>
+  /* Onboarding/landing-only theme override -- redeclares base.html's :root
+     tokens with a warm terracotta palette instead of the merchant portal's
+     pink/magenta. Scoped to whichever page includes this partial (each page
+     is its own document, so this doesn't leak into base.html's defaults or
+     any page that doesn't include it -- the portal stays pink on purpose,
+     this wasn't asked to change). */
+  :root {
+    --color-primary: #C1440E;
+    --color-primary-dark: #963709;
+    --color-primary-light: #FBE4D6;
+    --color-primary-lighter: #FDF3EC;
+
+    --color-ink: #2B1D12;
+    --color-muted: #8A7A68;
+    --color-bg: #FDF8F3;
+    --color-surface: #FFFFFF;
+    --color-border: #EDE1D3;
+
+    --shadow-md: 0 4px 16px rgba(193, 68, 14, 0.14);
+  }
+</style>

@@ -3,13 +3,15 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
 
 load_dotenv()  # must run before os.environ[...] reads below, or db.init_db()'s env reads
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.templating import Jinja2Templates
 
 import payments
 import db.repository as db
@@ -128,8 +130,20 @@ app.include_router(portal_products_router)
 app.include_router(portal_settings_router)
 
 
-@app.get("/")
+_TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+_landing_templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+
+@app.get("/", response_class=HTMLResponse)
+async def landing(request: Request):
+    return _landing_templates.TemplateResponse(request, "landing.html", {})
+
+
+@app.get("/health")
 async def health():
+    """Moved off "/" once that became the marketing landing page above --
+    deployment platforms (Railway) should point their health check at this
+    path instead."""
     return {"status": "ok"}
 
 
