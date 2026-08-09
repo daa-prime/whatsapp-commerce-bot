@@ -14,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 import payments
 import db.repository as db
 from admin.onboarding import router as onboarding_router
+from admin.onboarding_wizard import router as onboarding_wizard_router
 from core.commerce_flow import handle_incoming, handle_payment_failure, handle_payment_success
 from core.history import get_history, get_session_store
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
@@ -113,6 +114,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+app.include_router(onboarding_wizard_router)
 app.include_router(onboarding_router)
 
 

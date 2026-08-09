@@ -1,0 +1,377 @@
+{% extends "base.html" %}
+{% block title %}Onboard a new tenant — ShopTransact{% endblock %}
+{% block content %}
+
+<h1>Onboard a new tenant</h1>
+<p class="subtitle">A guided setup for a new commerce merchant — Meta WhatsApp access, catalog &amp; payment, and their first products, all in one pass.</p>
+
+{% if errors %}
+<div class="error-banner">
+  <strong>Please fix the following before submitting:</strong>
+  <ul>
+    {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+</div>
+{% endif %}
+
+<form method="post" action="/admin/onboard-tenant" enctype="multipart/form-data" id="wizard-form">
+  <div class="card">
+    <label>Admin secret</label>
+    <input type="password" name="admin_secret" value="{{ v.admin_secret or '' }}" required>
+    <p class="hint">Required to submit this wizard — protects tenant creation from unauthenticated use.</p>
+  </div>
+
+  <div class="step-layout">
+    <nav class="step-rail" id="step-rail">
+      <button type="button" class="step-rail-item" data-step="0"><span class="dot">1</span> Choose your setup</button>
+      <button type="button" class="step-rail-item" data-step="1"><span class="dot">2</span> Meta Business Account</button>
+      <button type="button" class="step-rail-item" data-step="2"><span class="dot">3</span> WhatsApp on Meta App</button>
+      <button type="button" class="step-rail-item" data-step="3"><span class="dot">4</span> Verification &amp; number</button>
+      <button type="button" class="step-rail-item" data-step="4"><span class="dot">5</span> System User token</button>
+      <button type="button" class="step-rail-item" data-step="5"><span class="dot">6</span> Meta credentials</button>
+      <button type="button" class="step-rail-item" data-step="6"><span class="dot">7</span> Catalog &amp; payment</button>
+      <button type="button" class="step-rail-item" data-step="7"><span class="dot">8</span> Business details</button>
+      <button type="button" class="step-rail-item" data-step="8"><span class="dot">9</span> Review &amp; submit</button>
+    </nav>
+
+    <div>
+      <!-- Step 0: Choose your setup -->
+      <div class="wizard-step" data-step="0">
+        <div class="card">
+          <h2>Do you already sell online?</h2>
+          <p class="hint">This only changes how you'll add products in Step 7 — nothing here connects to your
+            existing store automatically yet (that's a later addition, once a real case needs it).</p>
+          <input type="hidden" name="product_entry_mode" id="product_entry_mode" value="{{ v.product_entry_mode or 'manual' }}">
+          <div class="choice-cards">
+            <label class="choice-card" data-mode="csv" id="choice-card-csv">
+              <input type="radio" name="_setup_choice" value="csv">
+              <div class="choice-title">I have an existing online store</div>
+              <p class="choice-desc">Upload a CSV of your products in Step 7.</p>
+            </label>
+            <label class="choice-card" data-mode="manual" id="choice-card-manual">
+              <input type="radio" name="_setup_choice" value="manual">
+              <div class="choice-title">I'm starting fresh</div>
+              <p class="choice-desc">Add your first few products one at a time in Step 7.</p>
+            </label>
+          </div>
+        </div>
+        <div class="step-nav"><span></span><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 1 -->
+      <div class="wizard-step" data-step="1">
+        <div class="card steps-box">
+          <h2>Create a Meta Business Account</h2>
+          <p>Go to <a href="https://business.facebook.com" target="_blank" rel="noopener">business.facebook.com</a> and
+            sign in, then create a Business Account for the business — skip this if one already exists.</p>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 2 -->
+      <div class="wizard-step" data-step="2">
+        <div class="card steps-box">
+          <h2>Set up WhatsApp on a Meta App</h2>
+          <p>At <a href="https://developers.facebook.com" target="_blank" rel="noopener">developers.facebook.com</a>,
+            create an app, then add the WhatsApp product to it.</p>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 3 -->
+      <div class="wizard-step" data-step="3">
+        <div class="card steps-box">
+          <h2>Business verification, production number &amp; payment method</h2>
+          <p>Verify the real business, register their production WhatsApp number, and add a payment method to the
+            Meta app (it's free to add — you're only charged per message later).</p>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 4 -->
+      <div class="wizard-step" data-step="4">
+        <div class="card steps-box">
+          <h2>Generate a System User access token</h2>
+          <p>In Business Settings → Users → System Users, generate a <strong>System User access token</strong>.
+            Do not use the default temporary token from the API Setup page — it expires roughly every 24 hours,
+            while a System User token doesn't.</p>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 5: Meta credentials -->
+      <div class="wizard-step" data-step="5">
+        <div class="card">
+          <h2>Meta credentials</h2>
+          <label>Business name</label>
+          <input type="text" name="name" value="{{ v.name or '' }}" required>
+
+          <label>WhatsApp phone_number_id</label>
+          <input type="text" name="whatsapp_phone_number_id" value="{{ v.whatsapp_phone_number_id or '' }}" required>
+
+          <label>Access token (the System User token from Step 4)</label>
+          <input type="text" name="access_token" value="{{ v.access_token or '' }}">
+
+          <label>App secret</label>
+          <input type="text" name="app_secret" value="{{ v.app_secret or '' }}">
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 6: Catalog & payment + products -->
+      <div class="wizard-step" data-step="6">
+        <div class="card">
+          <h2>Catalog &amp; payment gateway</h2>
+          <label>Meta Catalog ID</label>
+          <input type="text" name="meta_catalog_id" value="{{ v.meta_catalog_id or '' }}">
+          <p class="hint">From Meta Commerce Manager, once the catalog is linked. Leave blank if you haven't set this up yet — you can add it later.</p>
+
+          <label>Payment gateway provider</label>
+          <select name="payment_gateway_provider">
+            <option value="" {{ 'selected' if (v.payment_gateway_provider or 'razorpay') == '' else '' }}>Not set up yet</option>
+            <option value="razorpay" {{ 'selected' if (v.payment_gateway_provider or 'razorpay') == 'razorpay' else '' }}>Razorpay</option>
+          </select>
+
+          <label>Razorpay Key ID</label>
+          <input type="text" name="payment_gateway_key_id" value="{{ v.payment_gateway_key_id or '' }}" placeholder="rzp_live_...">
+
+          <label>Razorpay Key Secret</label>
+          <input type="password" name="payment_gateway_api_key_ref" value="{{ v.payment_gateway_api_key_ref or '' }}">
+
+          <label>Razorpay Webhook Secret</label>
+          <input type="password" name="payment_gateway_webhook_secret" value="{{ v.payment_gateway_webhook_secret or '' }}">
+          <p class="hint">Leave any of these blank if you haven't set them up yet — you can add them later from Settings.</p>
+        </div>
+
+        <div class="card" id="csv-mode-section">
+          <h2>Import your products</h2>
+          <label>Product CSV</label>
+          <input type="file" name="csv_file" accept=".csv">
+          <p class="hint">Columns: <code>name, price, description, image_url, sku, stock_quantity, category</code> — a header row is required.</p>
+        </div>
+
+        <div class="card" id="manual-mode-section">
+          <h2>Add your products</h2>
+          <div id="product-rows-container"></div>
+          <button type="button" class="btn btn-secondary" id="add-product-btn">+ Add another product</button>
+        </div>
+
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step">Continue</button></div>
+      </div>
+
+      <!-- Step 7: Business details -->
+      <div class="wizard-step" data-step="7">
+        <div class="card">
+          <h2>Business details</h2>
+          <label>Welcome message text</label>
+          <textarea name="welcome_message_text" placeholder="e.g. Hi! Welcome to Kalpana General Store 👋 Browse our products and place your order right here on WhatsApp.">{{ v.welcome_message_text or '' }}</textarea>
+
+          <label>Timezone (IANA name)</label>
+          <input type="text" name="timezone" value="{{ v.timezone or '' }}" placeholder="Asia/Kolkata">
+          <p class="hint">Leave blank to default to Asia/Kolkata.</p>
+
+          <label>Abandoned cart nudge (hours)</label>
+          <input type="text" name="abandoned_cart_nudge_hours" value="{{ v.abandoned_cart_nudge_hours or '' }}" placeholder="2">
+          <p class="hint">How long an order sits at "pending payment" before we remind the customer. Leave blank to default to 2 hours.</p>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><button type="button" class="btn btn-primary next-step" id="goto-review">Review &amp; submit</button></div>
+      </div>
+
+      <!-- Step 8: Review & submit -->
+      <div class="wizard-step" data-step="8">
+        <div class="card">
+          <div class="review-section">
+            <h3>Meta credentials <button type="button" class="btn-link" data-goto-step="5">Edit</button></h3>
+            <div id="review-meta"></div>
+          </div>
+          <div class="review-section">
+            <h3>Catalog &amp; payment <button type="button" class="btn-link" data-goto-step="6">Edit</button></h3>
+            <div id="review-payment"></div>
+          </div>
+          <div class="review-section">
+            <h3>Products <button type="button" class="btn-link" data-goto-step="6">Edit</button></h3>
+            <div id="review-products"></div>
+          </div>
+          <div class="review-section">
+            <h3>Business details <button type="button" class="btn-link" data-goto-step="7">Edit</button></h3>
+            <div id="review-business"></div>
+          </div>
+          <p class="hint">Once submitted, this tenant's storefront will be live within a few minutes — the
+            WhatsApp webhook and payment webhook are ready to receive traffic as soon as the credentials above
+            are correct.</p>
+          <button type="submit" class="btn btn-primary">Create tenant</button>
+        </div>
+        <div class="step-nav"><button type="button" class="btn btn-secondary prev-step">Back</button><span></span></div>
+      </div>
+    </div>
+  </div>
+</form>
+
+<template id="product-row-template">
+  <div class="product-row">
+    <button type="button" class="remove-product">Remove</button>
+    <div class="product-row-grid">
+      <div>
+        <label>Name</label>
+        <input type="text" name="product_name">
+      </div>
+      <div>
+        <label>Price (₹)</label>
+        <input type="text" name="product_price">
+      </div>
+      <div>
+        <label>Category</label>
+        <input type="text" name="product_category">
+      </div>
+      <div>
+        <label>Stock quantity</label>
+        <input type="text" name="product_stock_quantity" value="0">
+      </div>
+      <div>
+        <label>Image URL</label>
+        <input type="text" name="product_image_url">
+      </div>
+      <div>
+        <label>SKU</label>
+        <input type="text" name="product_sku">
+      </div>
+    </div>
+    <label>Description</label>
+    <textarea name="product_description"></textarea>
+  </div>
+</template>
+
+<script>
+(function () {
+  var STEP_COUNT = 9;
+  var rail = document.querySelectorAll('.step-rail-item');
+  var steps = document.querySelectorAll('.wizard-step');
+
+  function showStep(n) {
+    n = Math.max(0, Math.min(STEP_COUNT - 1, n));
+    steps.forEach(function (s) { s.classList.toggle('active', s.dataset.step === String(n)); });
+    rail.forEach(function (r) {
+      var i = parseInt(r.dataset.step, 10);
+      r.classList.toggle('active', i === n);
+      r.classList.toggle('complete', i < n);
+    });
+    if (n === STEP_COUNT - 1) populateReview();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  rail.forEach(function (r) {
+    r.addEventListener('click', function () { showStep(parseInt(r.dataset.step, 10)); });
+  });
+  document.querySelectorAll('.next-step').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var current = document.querySelector('.wizard-step.active');
+      showStep(parseInt(current.dataset.step, 10) + 1);
+    });
+  });
+  document.querySelectorAll('.prev-step').forEach(function (btn) {
+    btn.addEventListener('click', function () {
+      var current = document.querySelector('.wizard-step.active');
+      showStep(parseInt(current.dataset.step, 10) - 1);
+    });
+  });
+  document.querySelectorAll('[data-goto-step]').forEach(function (btn) {
+    btn.addEventListener('click', function () { showStep(parseInt(btn.dataset.gotoStep, 10)); });
+  });
+
+  // Step 0: setup choice -> product_entry_mode + toggle csv/manual sections in Step 6
+  var modeInput = document.getElementById('product_entry_mode');
+  var csvSection = document.getElementById('csv-mode-section');
+  var manualSection = document.getElementById('manual-mode-section');
+
+  function applyMode(mode) {
+    modeInput.value = mode;
+    document.getElementById('choice-card-csv').classList.toggle('selected', mode === 'csv');
+    document.getElementById('choice-card-manual').classList.toggle('selected', mode === 'manual');
+    csvSection.style.display = mode === 'csv' ? '' : 'none';
+    manualSection.style.display = mode === 'manual' ? '' : 'none';
+  }
+
+  document.querySelectorAll('.choice-card').forEach(function (card) {
+    card.addEventListener('click', function () { applyMode(card.dataset.mode); });
+  });
+  applyMode(modeInput.value || 'manual');
+
+  // Step 6 manual products: repeatable rows
+  var template = document.getElementById('product-row-template');
+  var container = document.getElementById('product-rows-container');
+
+  function addProductRow() {
+    var node = template.content.cloneNode(true);
+    node.querySelector('.remove-product').addEventListener('click', function (e) {
+      e.target.closest('.product-row').remove();
+    });
+    container.appendChild(node);
+  }
+  document.getElementById('add-product-btn').addEventListener('click', addProductRow);
+  addProductRow(); // start with one row
+
+  // Step 8: populate review from current form values
+  function maskSecret(val) {
+    if (!val) return 'not set';
+    if (val.length <= 4) return '••••';
+    return '••••' + val.slice(-4);
+  }
+  function esc(s) {
+    var d = document.createElement('div');
+    d.textContent = s == null ? '' : s;
+    return d.innerHTML;
+  }
+  function row(label, value) {
+    return '<div class="review-row"><p class="label">' + esc(label) + '</p><p class="value">' + esc(value) + '</p></div>';
+  }
+  function val(name) {
+    var el = document.querySelector('[name="' + name + '"]');
+    return el ? el.value : '';
+  }
+
+  function populateReview() {
+    document.getElementById('review-meta').innerHTML =
+      row('Business name', val('name')) +
+      row('phone_number_id', val('whatsapp_phone_number_id')) +
+      row('Access token', maskSecret(val('access_token'))) +
+      row('App secret', maskSecret(val('app_secret')));
+
+    var provider = val('payment_gateway_provider') || 'not set';
+    document.getElementById('review-payment').innerHTML =
+      row('Meta Catalog ID', val('meta_catalog_id') || 'not set') +
+      row('Payment provider', provider) +
+      row('Razorpay Key ID', val('payment_gateway_key_id') || 'not set') +
+      row('Razorpay Key Secret', maskSecret(val('payment_gateway_api_key_ref'))) +
+      row('Razorpay Webhook Secret', maskSecret(val('payment_gateway_webhook_secret')));
+
+    var mode = modeInput.value;
+    var productsHtml = '';
+    if (mode === 'csv') {
+      var fileInput = document.querySelector('[name="csv_file"]');
+      var fileName = (fileInput && fileInput.files && fileInput.files[0]) ? fileInput.files[0].name : null;
+      productsHtml = row('Import method', 'CSV upload') + row('File', fileName || 'no file chosen yet');
+    } else {
+      var names = document.querySelectorAll('[name="product_name"]');
+      var prices = document.querySelectorAll('[name="product_price"]');
+      if (names.length === 0) {
+        productsHtml = row('Products', 'none added yet');
+      } else {
+        names.forEach(function (n, i) {
+          if (n.value) productsHtml += row(n.value, '₹' + (prices[i] ? prices[i].value : ''));
+        });
+        if (!productsHtml) productsHtml = row('Products', 'none added yet');
+      }
+    }
+    document.getElementById('review-products').innerHTML = productsHtml;
+
+    document.getElementById('review-business').innerHTML =
+      row('Welcome message', val('welcome_message_text') || 'not set') +
+      row('Timezone', val('timezone') || 'Asia/Kolkata (default)') +
+      row('Abandoned cart nudge', (val('abandoned_cart_nudge_hours') || '2') + ' hours');
+  }
+
+  showStep(0);
+})();
+</script>
+
+{% endblock %}

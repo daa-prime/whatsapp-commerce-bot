@@ -1,19 +1,14 @@
 # tests/test_onboarding.py
 """
-The guided onboarding wizard. Proves a new tenant can be added end-to-end
-through the plain HTML form (POST /admin/onboard-tenant) without touching the
-database or code directly, and that the newly created tenant immediately
-works with per-message routing (a webhook for its own phone_number_id, signed
-with its own app_secret, is accepted and processed).
+The catalog/payment-gateway edit step (POST/GET /admin/tenant/{id}/catalog-payment)
+-- lets an operator add or update a tenant's catalog/payment/abandoned-cart-nudge
+settings after initial creation, without re-running the whole onboarding flow.
 
-Phase 0: the hospital product's departments-and-doctors step (Step 7) is
-gone along with that domain logic — the doctor-line-DSL validation tests that
-went with it are gone too. What's left is the tenant-identity/Meta-credential/
-data-connection-tier surface, which is genuinely reusable infrastructure.
+Tenant *creation* itself moved to the guided step-rail wizard
+(admin/onboarding_wizard.py, tests/test_onboarding_wizard.py) -- the old flat
+create-form tests that used to live here were migrated there, since the old
+/admin/onboard-tenant flat form no longer exists at that URL.
 """
-import hashlib
-import hmac
-import json
 import os
 
 import db.repository as db
@@ -39,180 +34,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 client = TestClient(app)
 
-VALID_FORM = {
-    "admin_secret": "test-admin-secret",
-    "name": "St. Jude Storefront",
-    "whatsapp_phone_number_id": "NEW_TENANT_PHONE_ID",
-    "access_token": "new-tenant-token",
-    "app_secret": "new-tenant-secret",
-    "welcome_message_text": "Welcome to St. Jude Storefront!",
-    "data_tier": "tier1",
-}
-
-
-def _sign(body: bytes, secret: str) -> str:
-    return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-
-
-def _webhook_body(phone_number_id: str, from_phone: str, text: str) -> bytes:
-    return json.dumps({
-        "entry": [{"changes": [{"value": {
-            "metadata": {"phone_number_id": phone_number_id},
-            "messages": [{"from": from_phone, "type": "text", "text": {"body": text}}],
-        }}]}]
-    }).encode()
-
-
-def test_get_form_renders(tenant_id):
-    resp = client.get("/admin/onboard-tenant")
-    assert resp.status_code == 200
-    assert "Onboard a new tenant" in resp.text
-
-
-def test_successful_onboarding_creates_real_row_and_routing_works(tenant_id, httpx_mock):
-    resp = client.post("/admin/onboard-tenant", data=VALID_FORM)
-    assert resp.status_code == 200
-    assert "Tenant created" in resp.text
-    assert "St. Jude Storefront" in resp.text
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant is not None
-    assert tenant.name == "St. Jude Storefront"
-    assert tenant.access_token == "new-tenant-token"
-    assert tenant.app_secret == "new-tenant-secret"
-    assert tenant.timezone == "Asia/Kolkata"  # VALID_FORM leaves timezone blank -> sensible default
-    assert str(tenant.id) in resp.text
-
-    # Prove per-message routing actually works for this brand-new tenant: a
-    # webhook signed with ITS OWN app_secret, for ITS OWN phone_number_id, must
-    # be accepted and processed (not silently ignored).
-    httpx_mock.add_response(
-        url="https://graph.facebook.com/v22.0/NEW_TENANT_PHONE_ID/messages",
-        json={"messages": [{"id": "wamid.new"}]},
-    )
-    body = _webhook_body("NEW_TENANT_PHONE_ID", "5490009999", "hi")
-    resp2 = client.post(
-        "/webhook",
-        content=body,
-        headers={"X-Hub-Signature-256": _sign(body, "new-tenant-secret"), "Content-Type": "application/json"},
-    )
-    assert resp2.status_code == 200
-    assert len(httpx_mock.get_requests()) == 1  # the new tenant's own token/number were actually used
-
-
-def test_duplicate_phone_number_id_rejected(tenant_id):
-    form = dict(VALID_FORM, whatsapp_phone_number_id="123")  # "123" is the already-seeded tenant's number
-    before = db.find_tenant_by_phone_number_id("123")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert "already exists" in resp.text
-
-    after = db.find_tenant_by_phone_number_id("123")
-    assert before.id == after.id  # untouched, no duplicate/overwrite
-
-
-def test_timezone_can_be_overridden_at_onboarding(tenant_id):
-    form = dict(VALID_FORM, timezone="America/New_York")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 200
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.timezone == "America/New_York"
-
-
-def test_tier2_fields_save_correctly(tenant_id):
-    form = dict(VALID_FORM, data_tier="tier2", api_base_url="https://erp.stjude.example/api", api_key="tier2-secret-key")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 200
-    assert "Tier 2" in resp.text or "tier2" in resp.text.lower()
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.data_tier == "tier2"
-    assert tenant.external_api_base_url == "https://erp.stjude.example/api"
-    assert tenant.external_api_key == "tier2-secret-key"
-
-
-def test_tier2_without_api_fields_rejected(tenant_id):
-    form = dict(VALID_FORM, data_tier="tier2", api_base_url="", api_key="")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
-
-
-def test_tier3_shows_contact_us_message_with_no_fields_required(tenant_id):
-    """Tier 3 (direct DB connection) is explicitly not self-serve -- selecting
-    it must succeed with zero API fields submitted, and the confirmation page
-    must make clear this is a manually-assisted follow-up, not something the
-    wizard itself completed."""
-    form = dict(VALID_FORM, data_tier="tier3", api_base_url="", api_key="")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 200
-    assert "manually-assisted" in resp.text.lower() or "contact" in resp.text.lower() or "we'll be in touch" in resp.text.lower()
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.data_tier == "tier3"
-    assert tenant.external_api_base_url is None
-    assert tenant.external_api_key is None
-
-
-def test_missing_tenant_name_rejected(tenant_id):
-    form = dict(VALID_FORM, name="")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert "name is required" in resp.text.lower()
-
-
-def test_wrong_admin_secret_rejected(tenant_id):
-    form = dict(VALID_FORM, admin_secret="wrong-secret")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 403
-    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
-
-
-def test_missing_admin_secret_rejected(tenant_id):
-    form = dict(VALID_FORM)
-    del form["admin_secret"]
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 403
-
 
 # --- Catalog / payment gateway fields (SPEC.md Section 7, Phase 7) ---
-
-def test_catalog_and_payment_fields_save_correctly_at_create(tenant_id):
-    form = dict(
-        VALID_FORM,
-        meta_catalog_id="1234567890",
-        payment_gateway_provider="razorpay",
-        payment_gateway_api_key_ref="rzp_test_abc123",
-    )
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 200
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.meta_catalog_id == "1234567890"
-    assert tenant.payment_gateway_provider == "razorpay"
-    assert tenant.payment_gateway_api_key_ref == "rzp_test_abc123"
-
-
-def test_catalog_and_payment_fields_optional_at_create(tenant_id):
-    """A tenant frequently won't have catalog/payment set up yet at initial
-    onboarding -- leaving these blank must succeed, not be treated as a
-    validation error."""
-    resp = client.post("/admin/onboard-tenant", data=VALID_FORM)  # VALID_FORM has none of these fields
-    assert resp.status_code == 200
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.meta_catalog_id is None
-    assert tenant.payment_gateway_provider is None
-    assert tenant.payment_gateway_api_key_ref is None
-
-
-def test_invalid_payment_gateway_provider_rejected_at_create(tenant_id):
-    form = dict(VALID_FORM, payment_gateway_provider="stripe")  # not a supported provider yet
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
-
 
 def test_catalog_payment_edit_form_renders_with_current_values(tenant_id):
     resp = client.get(f"/admin/tenant/{tenant_id}/catalog-payment")
@@ -338,37 +161,6 @@ def test_catalog_payment_edit_isolated_across_tenants(tenant_id, second_tenant_i
 
 
 # --- Abandoned cart nudge hours (SPEC.md Phase 6) ---
-
-def test_abandoned_cart_nudge_hours_defaults_to_two_at_create(tenant_id):
-    resp = client.post("/admin/onboard-tenant", data=VALID_FORM)  # VALID_FORM leaves it blank
-    assert resp.status_code == 200
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.abandoned_cart_nudge_hours == 2
-
-
-def test_abandoned_cart_nudge_hours_can_be_set_at_create(tenant_id):
-    form = dict(VALID_FORM, abandoned_cart_nudge_hours="6")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 200
-
-    tenant = db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID")
-    assert tenant.abandoned_cart_nudge_hours == 6
-
-
-def test_abandoned_cart_nudge_hours_invalid_value_rejected_at_create(tenant_id):
-    form = dict(VALID_FORM, abandoned_cart_nudge_hours="not-a-number")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
-
-
-def test_abandoned_cart_nudge_hours_zero_rejected_at_create(tenant_id):
-    form = dict(VALID_FORM, abandoned_cart_nudge_hours="0")
-    resp = client.post("/admin/onboard-tenant", data=form)
-    assert resp.status_code == 400
-    assert db.find_tenant_by_phone_number_id("NEW_TENANT_PHONE_ID") is None
-
 
 def test_abandoned_cart_nudge_hours_editable_via_catalog_payment_form(tenant_id):
     resp = client.post(f"/admin/tenant/{tenant_id}/catalog-payment", data={

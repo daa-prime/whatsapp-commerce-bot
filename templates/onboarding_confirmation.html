@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}Tenant created — ShopTransact{% endblock %}
+{% block content %}
+
+<h1>Tenant created</h1>
+
+<div class="ok-banner">
+  <strong>{{ tenant.name }}</strong> was created with tenant ID <strong>{{ tenant.id }}</strong>
+  (phone_number_id: {{ tenant.whatsapp_phone_number_id }}).
+</div>
+
+<div class="card">
+  <h2>What's set up</h2>
+  <div class="review-row"><p class="label">Data connection</p><p class="value">{{ tier_note }}</p></div>
+  <div class="review-row"><p class="label">Meta Catalog ID</p><p class="value">{{ tenant.meta_catalog_id or "not set yet" }}</p></div>
+  <div class="review-row"><p class="label">Payment gateway</p><p class="value">{{ tenant.payment_gateway_provider or "not set yet" }}</p></div>
+  <div class="review-row"><p class="label">Products created</p><p class="value">{{ product_count }}</p></div>
+  <div class="review-row"><p class="label">Abandoned cart nudge</p><p class="value">{{ tenant.abandoned_cart_nudge_hours }} hour{{ "s" if tenant.abandoned_cart_nudge_hours != 1 else "" }}</p></div>
+</div>
+
+<p class="hint">
+  Reminder: this only recorded the credentials you entered — the business's own Meta Business/WhatsApp number
+  verification and System User access token must already have been set up on Meta's side beforehand. If that
+  wasn't done first, outbound messages and webhook signature validation for this tenant will fail until it is.
+</p>
+
+<p>
+  <a href="/admin/onboard-tenant" class="btn-link">Onboard another tenant</a> ·
+  <a href="/admin/tenant/{{ tenant.id }}/catalog-payment" class="btn-link">Edit catalog/payment details</a>
+</p>
+
+{% endblock %}
