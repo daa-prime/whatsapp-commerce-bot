@@ -6,3 +6,7 @@ __pycache__/
 .pytest_cache/
 .worktrees/
 *.db
+
+# Real client product exports/conversions dropped in the repo root for
+# scripts/convert_shopify_export.py -- business data, never committed.
+products_export*.csv
