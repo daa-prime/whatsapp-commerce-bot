@@ -14,6 +14,7 @@
   <h2>What's set up</h2>
   <div class="review-row"><p class="label">Data connection</p><p class="value">{{ tier_note }}</p></div>
   <div class="review-row"><p class="label">Meta Catalog ID</p><p class="value">{{ tenant.meta_catalog_id or "not set yet" }}</p></div>
+  <div class="review-row"><p class="label">Product feed URL</p><p class="value">{{ feed_url or "not available yet" }}</p></div>
   <div class="review-row"><p class="label">Payment gateway</p><p class="value">{{ tenant.payment_gateway_provider or "not set yet" }}</p></div>
   <div class="review-row"><p class="label">Products created</p><p class="value">{{ product_count }}</p></div>
   <div class="review-row"><p class="label">Abandoned cart nudge</p><p class="value">{{ tenant.abandoned_cart_nudge_hours }} hour{{ "s" if tenant.abandoned_cart_nudge_hours != 1 else "" }}</p></div>

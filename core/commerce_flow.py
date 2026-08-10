@@ -210,22 +210,72 @@ def _group_products_by_category(products: list[db.Product]) -> list[tuple[str, l
     return [(label, groups[label]) for label in order]
 
 
-async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, offset: int) -> bool:
-    """Sends the product list page starting at `offset`, grouped into one
-    WhatsApp list-message section per category (Meta's list messages support
-    multiple named sections natively -- this isn't a workaround, it's the
-    feature that shows a category as a heading in the browse UI). Returns
-    False (sends nothing) if the tenant has no active products at all --
-    callers handle that as an empty-catalog case, not an error.
+_MAX_NATIVE_PRODUCTS = 30  # Meta's product_list cap: up to 30 items across up to 10 sections
+_MAX_NATIVE_SECTIONS = 10
 
-    `offset` indexes into the flat, category-grouped product order (every
-    category's products consecutive, categories in first-appearance order),
-    not raw db id order -- so paginating keeps a category's products
-    together across "See more" pages rather than splitting one down the
-    middle. Products are then re-grouped into their sections after windowing/
-    capping, using the exact same MAX_LIST_ROWS-row-total math as before
-    grouping was added (see _cap_rows) -- section titles/headers don't count
-    against Meta's 10-row cap, only rows do.
+
+async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.Tenant, products: list[db.Product]) -> None:
+    """Meta's native multi-product message (core/whatsapp.py's
+    send_product_list) -- real product cards with images and full names,
+    rendered by WhatsApp itself from the catalog linked to tenant.
+    meta_catalog_id, replacing the list-message workaround below entirely
+    for any tenant that has one set. No 24-char title truncation, no
+    per-row-image limitation (both hard platform limits of list messages,
+    not something the old workaround could ever fully solve).
+
+    No in-message pagination beyond the first _MAX_NATIVE_PRODUCTS items --
+    unlike send_list, a product_list message's sections only ever contain
+    product_items; there's no equivalent of the list-message "See more
+    products" row to inject. A tenant with more active products than that
+    only sees the first 30 (first-appearance category order) via native
+    browsing today -- a known scope limit, not solved here, same as this
+    module's other explicitly-flagged deliberate scope cuts."""
+    grouped = _group_products_by_category(products)
+    sections = []
+    remaining = _MAX_NATIVE_PRODUCTS
+    for label, plist in grouped:
+        if remaining <= 0 or len(sections) >= _MAX_NATIVE_SECTIONS:
+            break
+        window = [p for p in plist if p.catalog_retailer_id][:remaining]
+        if not window:
+            continue
+        sections.append({
+            "title": label[:24],
+            "product_items": [{"product_retailer_id": p.catalog_retailer_id} for p in window],
+        })
+        remaining -= len(window)
+
+    await wa.send_product_list(
+        to=phone,
+        catalog_id=tenant.meta_catalog_id,
+        sections=sections,
+        body_text="Browse our products:",
+    )
+
+
+async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, offset: int) -> bool:
+    """Sends the product list page starting at `offset`. Returns False
+    (sends nothing) if the tenant has no active products at all -- callers
+    handle that as an empty-catalog case, not an error.
+
+    Branches on tenant.meta_catalog_id: if set, sends Meta's native
+    product_list message (_send_native_product_list) instead of the
+    list-message workaround below -- every tenant without one set (the
+    default, and the automatic fallback for any tenant whose catalog isn't
+    linked yet) keeps getting exactly today's behavior, unchanged.
+
+    The list-message path below groups into one section per category
+    (Meta's list messages support multiple named sections natively -- this
+    isn't a workaround, it's the feature that shows a category as a heading
+    in the browse UI). `offset` indexes into the flat, category-grouped
+    product order (every category's products consecutive, categories in
+    first-appearance order), not raw db id order -- so paginating keeps a
+    category's products together across "See more" pages rather than
+    splitting one down the middle. Products are then re-grouped into their
+    sections after windowing/capping, using the exact same
+    MAX_LIST_ROWS-row-total math as before grouping was added (see
+    _cap_rows) -- section titles/headers don't count against Meta's 10-row
+    cap, only rows do.
 
     Pagination choice: with more than MAX_LIST_ROWS active products, this
     shows the first (MAX_LIST_ROWS - 1) and a "See more products" row rather
@@ -237,6 +287,11 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
     products = db.get_active_products(tenant_id)
     if not products:
         return False
+
+    tenant = db.get_tenant(tenant_id)
+    if tenant and tenant.meta_catalog_id:
+        await _send_native_product_list(wa, phone, tenant, products)
+        return True
 
     grouped = _group_products_by_category(products)
     flat = [p for _, plist in grouped for p in plist]
@@ -579,7 +634,16 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
         return
 
     sessions.reset(tenant_id, phone)
+    await _complete_checkout_from_cart(wa, tenant_id, phone, cart)
 
+
+async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone: str, cart: dict) -> None:
+    """The shared tail of both checkout paths: the tap-driven flow above
+    (_checkout, after its own empty-cart guard + session reset) and
+    handle_native_order below (Meta's native catalog cart, which has no
+    session to reset in the first place). Creates the order via
+    db.checkout_cart, generates a Razorpay payment link, and sends the
+    confirmation -- identical behavior regardless of which UI built the cart."""
     order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart)
 
     if order is None:
@@ -620,6 +684,53 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
         message += f"\n\nPay here to confirm your order: {payment_url}"
 
     await wa.send_text(phone, message)
+
+
+async def handle_native_order(wa: WhatsAppClient, tenant: db.Tenant, phone: str, product_items: list[dict]) -> None:
+    """Entry point for Meta's native order webhook (SPEC.md Section 3.2/
+    Phase 2) -- core/main.py dispatches straight here, bypassing the
+    tap-driven session state machine entirely, since there's no prior bot
+    conversation turn to resume for a cart WhatsApp built inside its own
+    native catalog UI (core/whatsapp.py's send_product_list).
+
+    Maps each product_retailer_id back to a local product via
+    db.get_product_by_retailer_id, dropping any that don't resolve (a
+    stale/rejected/never-synced catalog item -- logged, not fatal, same
+    "drop the bad item, don't fail the whole order" spirit as
+    db.checkout_cart's own unavailable_product_ids handling), then reuses
+    the exact same order-creation + payment-link logic the tap-driven flow
+    uses via _complete_checkout_from_cart."""
+    cart: dict[str, int] = {}
+    for item in product_items:
+        retailer_id = item.get("product_retailer_id")
+        quantity = item.get("quantity")
+        if not retailer_id or quantity in (None, ""):
+            continue
+        try:
+            qty = int(quantity)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+
+        product = db.get_product_by_retailer_id(tenant.id, retailer_id)
+        if product is None or not product.is_active:
+            logger.warning(
+                "Native order for tenant=%s referenced unknown/inactive retailer_id=%s, dropping item",
+                tenant.id, retailer_id,
+            )
+            continue
+
+        key = str(product.id)
+        cart[key] = cart.get(key, 0) + qty
+
+    if not cart:
+        await wa.send_text(
+            phone, "Sorry, we couldn't process your order — none of the items are available right now.",
+        )
+        return
+
+    await _complete_checkout_from_cart(wa, tenant.id, phone, cart)
 
 
 # --- Payment webhook handlers (SPEC.md Section 3.3, Phase 3) ---

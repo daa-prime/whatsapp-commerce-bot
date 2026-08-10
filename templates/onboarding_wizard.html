@@ -126,6 +126,14 @@
           <label>Meta Catalog ID</label>
           <input type="text" name="meta_catalog_id" value="{{ v.meta_catalog_id or '' }}">
           <p class="hint">From Meta Commerce Manager, once the catalog is linked. Leave blank if you haven't set this up yet — you can add it later.</p>
+          <p class="hint">
+            Once you have a catalog created and linked to this WhatsApp number, register this
+            store's product feed as its data source in Commerce Manager (Catalog &rarr; Data Sources
+            &rarr; Add Items &rarr; Data Feed) so your products sync automatically — the exact feed
+            URL to paste in there is shown on the confirmation page after you submit this wizard,
+            and again any time on the catalog/payment edit page. Meta typically takes a little while
+            to pull and approve a new feed, so give it some time before relying on it.
+          </p>
 
           <label>Payment gateway provider</label>
           <select name="payment_gateway_provider">

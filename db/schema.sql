@@ -124,6 +124,15 @@ CREATE TABLE IF NOT EXISTS products (
     created_at TEXT NOT NULL DEFAULT (now()::text)
 );
 
+-- The stable id Meta's catalog (and the order webhook it sends back) knows
+-- this product by -- "retailer_id" in Meta's own terminology. Deterministic
+-- (f"t{tenant_id}-p{product.id}"), not sourced from products.sku: a real
+-- client's Shopify export had a SKU on only 7 of 1173 rows, so SKU can't be
+-- relied on as a stable, always-present, always-unique catalog identity.
+-- Added after products already had committed history, hence ADD COLUMN IF
+-- NOT EXISTS rather than being in the CREATE TABLE above.
+ALTER TABLE products ADD COLUMN IF NOT EXISTS catalog_retailer_id TEXT;
+
 -- 'browsing' is the pre-order state: a row created as soon as a customer
 -- starts interacting, before any line items or pricing are known yet, which
 -- is why subtotal/total are nullable rather than NOT NULL like the hospital

@@ -213,6 +213,7 @@ class Product:
     stock_quantity: int
     category: str | None
     is_active: bool
+    catalog_retailer_id: str | None  # the id Meta's catalog/order-webhook knows this product by
 
 
 def _row_to_product(row) -> Product:
@@ -228,7 +229,16 @@ def _row_to_product(row) -> Product:
         stock_quantity=row["stock_quantity"],
         category=row["category"],
         is_active=bool(row["is_active"]),
+        catalog_retailer_id=row["catalog_retailer_id"],
     )
+
+
+def _catalog_retailer_id(tenant_id: int, product_id: int) -> str:
+    """Deterministic, always-unique-by-construction id for Meta's catalog
+    feed/order-webhook to reference this product by -- not sourced from
+    products.sku, which real merchant data can't be relied on to have (a
+    real client's Shopify export had a SKU on only 7 of 1173 rows)."""
+    return f"t{tenant_id}-p{product_id}"
 
 
 def get_product(tenant_id: int, product_id: int) -> Product | None:
@@ -236,6 +246,21 @@ def get_product(tenant_id: int, product_id: int) -> Product | None:
     row = conn.execute(
         "SELECT * FROM products WHERE tenant_id = ? AND id = ?",
         (tenant_id, product_id),
+    ).fetchone()
+    return _row_to_product(row) if row else None
+
+
+def get_product_by_retailer_id(tenant_id: int, retailer_id: str) -> Product | None:
+    """Resolves a Meta catalog/order-webhook product_retailer_id back to the
+    local product it refers to -- the reverse direction of
+    _catalog_retailer_id(). Returns None for a retailer_id that doesn't
+    resolve (a stale/rejected catalog item) rather than raising; callers
+    (core/commerce_flow.py's handle_native_order) drop unresolvable items
+    from the order instead of failing the whole thing."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM products WHERE tenant_id = ? AND catalog_retailer_id = ?",
+        (tenant_id, retailer_id),
     ).fetchone()
     return _row_to_product(row) if row else None
 
@@ -262,9 +287,10 @@ def create_product(
     stock_quantity: int = 0,
     category: str | None = None,
 ) -> Product:
-    """Manual product entry for now -- Phase 1's real catalog sync (SPEC.md
-    Section 3.1) will call this (or its own bulk-upsert variant) once a
-    tenant's Meta Commerce Manager catalog is linked."""
+    """Manual product entry (also the target of the wizard's/portal's CSV
+    bulk import) -- Phase 1's real catalog sync (SPEC.md Section 3.1) reads
+    catalog_retailer_id (set below, right after insert since it's derived
+    from the row's own new id) rather than writing to Meta's catalog directly."""
     conn = get_connection()
     cur = conn.execute(
         "INSERT INTO products (tenant_id, name, price, currency, description, image_url, sku, "
@@ -272,6 +298,10 @@ def create_product(
         (tenant_id, name, price, currency, description, image_url, sku, stock_quantity, category),
     )
     new_id = cur.fetchone()["id"]
+    conn.execute(
+        "UPDATE products SET catalog_retailer_id = ? WHERE tenant_id = ? AND id = ?",
+        (_catalog_retailer_id(tenant_id, new_id), tenant_id, new_id),
+    )
     conn.commit()
     return get_product(tenant_id, new_id)
 

@@ -162,6 +162,59 @@ class WhatsAppClient:
         else:
             logger.error("WhatsApp send_buttons error %s: %s", resp.status_code, resp.text)
 
+    async def send_product_list(
+        self,
+        to: str,
+        catalog_id: str,
+        sections: list[dict],
+        body_text: str,
+        header_text: str | None = None,
+        footer_text: str | None = None,
+    ) -> None:
+        """
+        Send a WhatsApp multi-product message (interactive.type
+        "product_list") -- Meta's native catalog browsing UI: real product
+        cards with images and full names, pulled live from the catalog
+        linked to this WABA, not the 24-char-truncated/no-image list
+        message send_list sends. Requires a catalog to already be linked to
+        this phone_number_id's WABA and each product_retailer_id referenced
+        below to already be a synced, approved catalog item -- sending this
+        before that's true is expected to fail or render incompletely
+        (unverified against a live payload in this codebase yet, see
+        catalog/feed.py's module docstring).
+
+        sections: [{"title": str, "product_items": [{"product_retailer_id": str}, ...]}]
+        Meta's real limit here is materially better than send_list's flat
+        10-row cap: up to 30 items across up to 10 sections.
+        """
+        to = normalize_phone(to)
+        url = f"{WA_API_BASE}/{self._phone_number_id}/messages"
+        interactive = {
+            "type": "product_list",
+            "body": {"text": body_text},
+            "action": {"catalog_id": catalog_id, "sections": sections},
+        }
+        if header_text:
+            interactive["header"] = {"type": "text", "text": header_text}
+        if footer_text:
+            interactive["footer"] = {"text": footer_text}
+        payload = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": "interactive",
+            "interactive": interactive,
+        }
+        logger.info("WhatsApp send_product_list: POSTing to %s for %s", url, to)
+        try:
+            resp = await self._client.post(url, json=payload, headers=self._headers)
+        except httpx.HTTPError:
+            logger.exception("WhatsApp send_product_list request to %s failed (network/transport error)", url)
+            return
+        if resp.is_success:
+            logger.info("WhatsApp send_product_list: %s OK for %s", resp.status_code, to)
+        else:
+            logger.error("WhatsApp send_product_list error %s: %s", resp.status_code, resp.text)
+
 
 def parse_incoming_message(message: dict) -> dict:
     """
@@ -169,8 +222,20 @@ def parse_incoming_message(message: dict) -> dict:
       {"type": "text", "text": str}
       {"type": "interactive_reply", "id": str, "title": str}  — a tapped list/button option
       {"type": "audio"}
+      {"type": "order", "catalog_id": str, "product_items": list[dict]}  — a native catalog cart send
       {"type": "unsupported"}
     Centralizes payload parsing so nothing else in the app touches Meta's raw shapes.
+
+    The "order" shape (SPEC.md Section 3.2/Phase 2) is sent when a customer
+    completes a cart built entirely inside WhatsApp's own native catalog UI
+    (send_product_list above) and taps "Send order" -- unlike every other
+    branch here, there is no prior bot-driven conversation turn attached to
+    it; core/commerce_flow.py's handle_native_order() has no session to read
+    context from, it acts on exactly what's in this payload. product_items
+    entries carry product_retailer_id/quantity/item_price/currency per Meta's
+    documented shape -- not yet verified against a live payload in this repo
+    (see catalog/feed.py's module docstring for the same caveat applied to
+    outbound catalog messages).
     """
     msg_type = message.get("type")
 
@@ -190,6 +255,17 @@ def parse_incoming_message(message: dict) -> dict:
 
     if msg_type == "audio":
         return {"type": "audio"}
+
+    if msg_type == "order":
+        order = message.get("order", {})
+        product_items = order.get("product_items", [])
+        if not isinstance(product_items, list):
+            return {"type": "unsupported"}  # malformed payload -- fail safe, same as every other branch here
+        return {
+            "type": "order",
+            "catalog_id": order.get("catalog_id", ""),
+            "product_items": product_items,
+        }
 
     return {"type": "unsupported"}
 

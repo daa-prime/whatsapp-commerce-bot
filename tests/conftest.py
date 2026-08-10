@@ -15,6 +15,10 @@ os.environ.setdefault("ADMIN_SECRET", "test-admin-secret")
 # imported transitively the first time any test does `from core.main import app`.
 os.environ.setdefault("PORTAL_SESSION_SECRET", "test-portal-session-secret")
 os.environ.setdefault("PORTAL_COOKIE_SECURE", "false")  # tests run over plain TestClient HTTP, not real HTTPS
+# catalog/feed.py reads this lazily (not at import time), but set it here too
+# so every test gets a consistent, real feed_url() value rather than each
+# test file needing its own default.
+os.environ.setdefault("PUBLIC_BASE_URL", "https://test.example.com")
 
 # The app runs on Postgres (Neon in production), so tests need a real Postgres
 # to run against -- an in-memory swap-in-a-connection trick (a plain

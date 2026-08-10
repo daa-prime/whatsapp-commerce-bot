@@ -34,6 +34,7 @@ from fastapi.templating import Jinja2Templates
 
 import db.repository as db
 from admin.onboarding import ADMIN_SECRET, _VALID_PAYMENT_PROVIDERS
+from catalog.feed import feed_url
 from db.connection import IntegrityError
 
 router = APIRouter()
@@ -256,4 +257,5 @@ async def onboard_tenant_wizard_submit(request: Request):
         "tenant": tenant,
         "tier_note": "Using this platform's own database to manage orders (Tier 1).",
         "product_count": len(products),
+        "feed_url": feed_url(tenant.id),
     })

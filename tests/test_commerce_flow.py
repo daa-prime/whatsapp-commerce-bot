@@ -11,7 +11,9 @@ from unittest.mock import patch
 import pytest
 
 import db.repository as db
-from core.commerce_flow import MAX_LIST_ROWS, handle_incoming, handle_payment_failure, handle_payment_success
+from core.commerce_flow import (
+    MAX_LIST_ROWS, handle_incoming, handle_native_order, handle_payment_failure, handle_payment_success,
+)
 from core.history import InMemorySessionStore
 
 PHONE = "919999999999"
@@ -30,6 +32,11 @@ class FakeWhatsAppClient:
     async def send_buttons(self, to, body_text, buttons, header_text=None, header_image_url=None, footer_text=None):
         self.sent.append(("buttons", {
             "to": to, "body_text": body_text, "buttons": buttons, "header_image_url": header_image_url,
+        }))
+
+    async def send_product_list(self, to, catalog_id, sections, body_text, header_text=None, footer_text=None):
+        self.sent.append(("product_list", {
+            "to": to, "catalog_id": catalog_id, "sections": sections, "body_text": body_text,
         }))
 
 
@@ -301,6 +308,114 @@ async def test_product_detail_no_image_header_when_unset(wa, sessions, tenant_id
     await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{product.id}"))
 
     assert wa.sent[-1][1]["header_image_url"] is None
+
+
+# --- Native Meta catalog messages (SPEC.md Phase 1/2), with fallback ---
+
+@pytest.mark.asyncio
+async def test_shop_falls_back_to_list_message_without_meta_catalog_id(wa, sessions, tenant_id):
+    """The default -- and the automatic fallback for any tenant whose
+    catalog isn't linked yet -- must keep behaving exactly like today."""
+    _make_product(tenant_id, name="Widget", price="10.00")
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    assert wa.sent[-1][0] == "list"
+
+
+@pytest.mark.asyncio
+async def test_shop_sends_native_product_list_when_meta_catalog_id_set(wa, sessions, tenant_id):
+    db.update_tenant_catalog_and_payment(tenant_id, meta_catalog_id="cat_123")
+    product = _make_product(tenant_id, name="Widget", price="10.00", category="Tools")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+
+    assert wa.sent[-1][0] == "product_list"
+    sent = wa.sent[-1][1]
+    assert sent["catalog_id"] == "cat_123"
+    all_retailer_ids = {
+        item["product_retailer_id"] for section in sent["sections"] for item in section["product_items"]
+    }
+    assert all_retailer_ids == {product.catalog_retailer_id}
+
+
+@pytest.mark.asyncio
+async def test_native_product_list_groups_by_category(wa, sessions, tenant_id):
+    db.update_tenant_catalog_and_payment(tenant_id, meta_catalog_id="cat_123")
+    _make_product(tenant_id, name="Hammer", price="10.00", category="Tools")
+    _make_product(tenant_id, name="Shirt", price="10.00", category="Apparel")
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    titles = {s["title"] for s in wa.sent[-1][1]["sections"]}
+    assert titles == {"Tools", "Apparel"}
+
+
+def test_get_product_by_retailer_id_resolves_and_isolates_by_tenant(tenant_id, second_tenant_id):
+    product = _make_product(tenant_id, name="Widget", price="10.00")
+
+    assert db.get_product_by_retailer_id(tenant_id, product.catalog_retailer_id).id == product.id
+    assert db.get_product_by_retailer_id(tenant_id, "does-not-exist") is None
+    # Same retailer_id string never resolves under a different tenant.
+    assert db.get_product_by_retailer_id(second_tenant_id, product.catalog_retailer_id) is None
+
+
+@pytest.mark.asyncio
+async def test_handle_native_order_creates_order(wa, tenant_id):
+    tenant = db.get_tenant(tenant_id)
+    product = _make_product(tenant_id, name="Widget", price="199.00")
+
+    await handle_native_order(wa, tenant, PHONE, [
+        {"product_retailer_id": product.catalog_retailer_id, "quantity": "2", "item_price": "199.00", "currency": "INR"},
+    ])
+
+    orders = db.get_orders_for_phone(tenant_id, PHONE)
+    assert len(orders) == 1
+    items = db.get_order_items(tenant_id, orders[0].id)
+    assert len(items) == 1
+    assert items[0].quantity == 2
+    assert wa.sent[-1][0] == "text"
+    assert f"Order #{orders[0].id}" in wa.sent[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_handle_native_order_drops_unresolvable_retailer_id(wa, tenant_id):
+    tenant = db.get_tenant(tenant_id)
+    product = _make_product(tenant_id, name="Widget", price="199.00")
+
+    await handle_native_order(wa, tenant, PHONE, [
+        {"product_retailer_id": product.catalog_retailer_id, "quantity": "1", "item_price": "199.00", "currency": "INR"},
+        {"product_retailer_id": "stale-retailer-id-not-in-db", "quantity": "1", "item_price": "50.00", "currency": "INR"},
+    ])
+
+    orders = db.get_orders_for_phone(tenant_id, PHONE)
+    assert len(orders) == 1
+    items = db.get_order_items(tenant_id, orders[0].id)
+    assert len(items) == 1  # the unresolvable item was dropped, not fatal
+
+
+@pytest.mark.asyncio
+async def test_handle_native_order_all_items_unresolvable_sends_apology_creates_no_order(wa, tenant_id):
+    tenant = db.get_tenant(tenant_id)
+
+    await handle_native_order(wa, tenant, PHONE, [
+        {"product_retailer_id": "nonexistent", "quantity": "1", "item_price": "10.00", "currency": "INR"},
+    ])
+
+    assert db.get_orders_for_phone(tenant_id, PHONE) == []
+    assert wa.sent[-1][0] == "text"
+    assert "couldn't process" in wa.sent[-1][1]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_native_order_generates_payment_link_when_configured(wa, tenant_id):
+    _configure_razorpay(tenant_id)
+    tenant = db.get_tenant(tenant_id)
+    product = _make_product(tenant_id, name="Widget", price="199.00")
+
+    with patch("payments.create_payment_link", return_value=("https://rzp.io/pay/abc", "plink_abc")):
+        await handle_native_order(wa, tenant, PHONE, [
+            {"product_retailer_id": product.catalog_retailer_id, "quantity": "1"},
+        ])
+
+    assert "https://rzp.io/pay/abc" in wa.sent[-1][1]["text"]
 
 
 # --- Cross-tenant isolation ---

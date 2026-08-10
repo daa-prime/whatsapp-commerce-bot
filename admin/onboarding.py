@@ -24,6 +24,7 @@ from fastapi import APIRouter, Form
 from fastapi.responses import HTMLResponse
 
 import db.repository as db
+from catalog.feed import feed_url
 from portal.session import hash_password
 
 router = APIRouter()
@@ -89,6 +90,8 @@ def _catalog_payment_form_html(tenant, errors: list[str] | None = None, values: 
     <input type="text" name="meta_catalog_id" value="{esc('meta_catalog_id')}" placeholder="Currently: {catalog_current}">
     <p class="hint">Currently: {catalog_current}. Leave blank to keep it as-is —
       leave blank if you haven't set this up yet — you can add it later.</p>
+    <p class="hint">Product feed URL to register in Commerce Manager (Catalog &rarr; Data Sources &rarr;
+      Add Items &rarr; Data Feed): <strong>{html.escape(feed_url(tenant.id) or "not available yet — PUBLIC_BASE_URL isn't configured")}</strong></p>
 
     <label>Payment gateway provider</label>
     <select name="payment_gateway_provider">

@@ -107,6 +107,50 @@ def test_parse_incoming_message_audio():
     assert parse_incoming_message({"type": "audio", "audio": {"id": "media123"}}) == {"type": "audio"}
 
 
+def test_parse_incoming_message_order():
+    message = {
+        "type": "order",
+        "order": {
+            "catalog_id": "cat_123",
+            "product_items": [
+                {"product_retailer_id": "t1-p1", "quantity": "2", "item_price": "199.00", "currency": "INR"},
+            ],
+        },
+    }
+    assert parse_incoming_message(message) == {
+        "type": "order",
+        "catalog_id": "cat_123",
+        "product_items": [
+            {"product_retailer_id": "t1-p1", "quantity": "2", "item_price": "199.00", "currency": "INR"},
+        ],
+    }
+
+
+def test_parse_incoming_message_order_malformed_product_items_falls_back_unsupported():
+    message = {"type": "order", "order": {"catalog_id": "cat_123", "product_items": "not-a-list"}}
+    assert parse_incoming_message(message) == {"type": "unsupported"}
+
+
+def test_parse_incoming_message_order_missing_order_key():
+    assert parse_incoming_message({"type": "order"}) == {"type": "order", "catalog_id": "", "product_items": []}
+
+
+@pytest.mark.asyncio
+async def test_send_product_list_builds_interactive_payload(httpx_mock):
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "msg_id"}]})
+    client = WhatsAppClient(phone_number_id="123", access_token="token")
+    sections = [{"title": "Electronics", "product_items": [{"product_retailer_id": "t1-p1"}]}]
+    await client.send_product_list(to="54911111111", catalog_id="cat_123", sections=sections, body_text="Browse:")
+
+    request = httpx_mock.get_requests()[0]
+    payload = json.loads(request.content)
+    assert payload["type"] == "interactive"
+    assert payload["interactive"]["type"] == "product_list"
+    assert payload["interactive"]["action"]["catalog_id"] == "cat_123"
+    assert payload["interactive"]["action"]["sections"] == sections
+    assert payload["interactive"]["body"]["text"] == "Browse:"
+
+
 def test_parse_incoming_message_unsupported():
     assert parse_incoming_message({"type": "image", "image": {"id": "img123"}}) == {"type": "unsupported"}
 

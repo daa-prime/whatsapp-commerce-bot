@@ -15,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 
 import payments
 import db.repository as db
+from catalog.feed import PublicBaseURLNotConfigured, build_feed_csv
 from admin.onboarding import router as onboarding_router
 from admin.onboarding_wizard import router as onboarding_wizard_router
 from portal.auth import router as portal_auth_router
@@ -22,7 +23,7 @@ from portal.dashboard import router as portal_dashboard_router
 from portal.orders import router as portal_orders_router
 from portal.products import router as portal_products_router
 from portal.settings import router as portal_settings_router
-from core.commerce_flow import handle_incoming, handle_payment_failure, handle_payment_success
+from core.commerce_flow import handle_incoming, handle_native_order, handle_payment_failure, handle_payment_success
 from core.history import get_history, get_session_store
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
 from db.init_db import init_db
@@ -147,6 +148,23 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/catalog/{tenant_id}.csv")
+async def catalog_feed(tenant_id: int):
+    """Public, unauthenticated on purpose -- Meta's feed fetcher (Commerce
+    Manager) needs to reach this without any credential, the same reasoning
+    /webhook is unauthenticated and relies on payload signature validation
+    instead (a feed has no equivalent secret to check). Returns 404 for an
+    unknown/inactive tenant_id rather than an empty feed, so a typo'd
+    registration fails obviously instead of silently syncing nothing."""
+    try:
+        csv_text = build_feed_csv(tenant_id)
+    except PublicBaseURLNotConfigured as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    if csv_text is None:
+        raise HTTPException(status_code=404)
+    return PlainTextResponse(csv_text, media_type="text/csv")
+
+
 @app.get("/webhook")
 async def verify_webhook(
     hub_mode: str = Query(alias="hub.mode"),
@@ -238,15 +256,27 @@ async def _process_message(wa: WhatsAppClient, tenant: db.Tenant, phone: str, re
     """Process a single already-parsed incoming message with the (tenant, phone)
     lock already held.
 
-    Dispatches to core/commerce_flow.py's menu-driven state machine (Shop Now,
-    My Orders, Track Order, cart, checkout). This is a manual "type a message
-    to get a menu" flow, not yet driven by Meta's native catalog/cart
-    messages (SPEC.md Section 2) — Phase 1's real catalog integration and
-    Phase 2's `order` message type parsing still replace/extend this once a
-    live test catalog exists.
+    A native "order" message (Meta's catalog cart send, SPEC.md Section 3.2/
+    Phase 2) dispatches straight to handle_native_order, bypassing
+    core/commerce_flow.py's tap-driven session state machine entirely --
+    there's no prior bot conversation turn to resume for a cart WhatsApp
+    built entirely inside its own native catalog UI. Still processed under
+    this function's (tenant, phone) message lock like everything else, so a
+    redelivered order webhook can't race itself into creating two orders
+    from the same cart.
+
+    Everything else still dispatches to the menu-driven state machine (Shop
+    Now, My Orders, Track Order, cart, checkout) -- the fallback path for any
+    tenant without a linked Meta catalog (core/commerce_flow.py's
+    _send_product_list branches on tenant.meta_catalog_id).
     """
     logger.info("Dispatching message from %s (tenant %s): %s", phone, tenant.id, reply)
     HISTORY.add(phone, "user", reply.get("text") or reply.get("title") or f"[{reply.get('type')}]")
+
+    if reply["type"] == "order":
+        await handle_native_order(wa, tenant, phone, reply.get("product_items", []))
+        return
+
     await handle_incoming(wa, SESSIONS, phone, tenant.id, reply, tenant.name)
 
 
