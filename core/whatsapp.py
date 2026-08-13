@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import logging
 import httpx
 from core.phone import normalize_phone
@@ -224,6 +225,7 @@ class WhatsAppClient:
             "interactive": interactive,
         }
         logger.info("WhatsApp send_product_list: POSTing to %s for %s", url, to)
+        logger.info("WhatsApp send_product_list: full payload: %s", json.dumps(payload))
         try:
             resp = await self._client.post(url, json=payload, headers=self._headers)
         except httpx.HTTPError:
