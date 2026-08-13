@@ -10,3 +10,8 @@ __pycache__/
 # Real client product exports/conversions dropped in the repo root for
 # scripts/convert_shopify_export.py -- business data, never committed.
 products_export*.csv
+
+# Same reasoning -- real client product data, converted or raw. Kept on
+# disk in a permanent, well-known repo location (rather than a session
+# scratchpad) so it survives across sessions, but never committed.
+data/imports/
