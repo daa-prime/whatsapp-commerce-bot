@@ -5,6 +5,21 @@ redis==5.0.8
 python-dotenv==1.0.1
 python-multipart==0.0.20
 psycopg2-binary==2.9.10
+# setuptools<81 is required because razorpay==1.4.2's client.py does
+# `import pkg_resources` at import time -- pkg_resources ships inside
+# setuptools, but (a) setuptools isn't guaranteed present in a clean pip
+# install on Python 3.13 at all, and (b) setuptools>=81 removed
+# pkg_resources entirely (its own deprecation warning said as much:
+# "pkg_resources is deprecated... refrain from using this package or pin
+# to Setuptools<81"). A plain `setuptools` pin resolves to the latest
+# version and still crashes. Without this exact pin, `import payments` ->
+# `import razorpay` fails with ModuleNotFoundError: No module named
+# 'pkg_resources' the moment the app boots on a fresh environment
+# (confirmed by building a clean venv from just this file and booting
+# core.main against it) -- it only "worked" in local dev because an older
+# setuptools happened to already be present there from something else,
+# masking the gap.
+setuptools<81
 razorpay==1.4.2
 jinja2==3.1.4
 pytest==8.3.3
