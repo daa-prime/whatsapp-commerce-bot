@@ -236,6 +236,39 @@ async def test_my_orders_empty_state(wa, sessions, tenant_id):
 
 
 @pytest.mark.asyncio
+async def test_my_orders_works_when_tapped_from_a_stale_mid_flow_state(wa, sessions, tenant_id):
+    """Reproduces a real customer-reported bug: WhatsApp keeps every past
+    interactive message tappable indefinitely, so a customer can scroll
+    back and tap a stale "My Orders" button from an old main-menu message
+    while their session is actually mid-flow elsewhere (e.g. viewing a
+    product). That tap must still show order history, not fall into the
+    *current* state's handler (which doesn't recognize "menu_my_orders")
+    and loop on "Please choose an option from the list above" forever."""
+    product = _make_product(tenant_id, name="Widget", price="10.00")
+    order = db.create_order(tenant_id, customer_phone=PHONE, status=db.ORDER_STATUS_PAID,
+                             subtotal=Decimal("500.00"), total=Decimal("500.00"))
+
+    # Get the session into a non-IDLE state (viewing a product detail) --
+    # same as a customer mid-shopping would be.
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap(f"product_{product.id}"))
+    assert wa.sent[-1][0] == "buttons"  # confirmed: not IDLE, not the orders flow either
+
+    # Tap a stale "My Orders" button from an earlier main-menu message.
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_my_orders"))
+    assert wa.sent[-1][0] == "list"
+    rows = [row for section in wa.sent[-1][1]["sections"] for row in section["rows"]]
+    assert rows[0]["id"] == f"order_{order.id}"
+
+    # A second tap of the same stale button must behave identically, not
+    # repeat/compound the old bug (which looped on the *same* wrong reply).
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_my_orders"))
+    assert wa.sent[-1][0] == "list"
+    rows2 = [row for section in wa.sent[-1][1]["sections"] for row in section["rows"]]
+    assert rows2[0]["id"] == f"order_{order.id}"
+
+
+@pytest.mark.asyncio
 async def test_track_order_shows_order_status(wa, sessions, tenant_id):
     """Implemented identically to My Orders (pick from a recent-orders list)
     rather than free-text order-ref entry -- see commerce_flow.py's

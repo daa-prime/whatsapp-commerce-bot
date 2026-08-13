@@ -67,6 +67,13 @@ MENU_OFFERS = "menu_offers"
 MENU_ACCOUNT = "menu_account"
 MENU_TALK_TO_US = "menu_talk_to_us"
 
+# Main-menu button taps are recognized from *any* session state, not just
+# IDLE (see handle_incoming) -- WhatsApp keeps old interactive messages
+# tappable indefinitely, so a customer mid-flow can tap a stale main-menu
+# button from an earlier message; without this, that tap would be
+# misrouted into whatever handler the *current* state maps to instead.
+_MAIN_MENU_IDS = {MENU_SHOP, MENU_MY_ORDERS, MENU_TRACK_ORDER, MENU_OFFERS, MENU_ACCOUNT, MENU_TALK_TO_US}
+
 SHOP_MORE = "shop_more"
 ADD_TO_CART = "add_to_cart"
 BACK_TO_PRODUCTS = "back_to_products"
@@ -905,13 +912,31 @@ async def handle_incoming(
 ) -> None:
     """
     Entry point: check for a global reset keyword first (works from *any*
-    state, unlike the old booking_flow.py's IDLE-only fallback), then look up
-    the customer's current session (sessions.get already resets stale/timed-out
-    sessions to IDLE) and dispatch to the matching state handler.
+    state, unlike the old booking_flow.py's IDLE-only fallback), then check
+    for a main-menu button tap (same "works from any state" reasoning --
+    see _MAIN_MENU_IDS below), then look up the customer's current session
+    (sessions.get already resets stale/timed-out sessions to IDLE) and
+    dispatch to the matching state handler.
     """
     if reply["type"] == "text" and reply.get("text", "").strip().lower() in RESET_KEYWORDS:
         sessions.reset(tenant_id, phone)
         await _send_main_menu(wa, phone, tenant_name)
+        return
+
+    if reply["type"] == "interactive_reply" and reply.get("id") in _MAIN_MENU_IDS:
+        # WhatsApp keeps every past interactive message tappable indefinitely
+        # -- a customer mid-flow (viewing a product, sitting in their cart,
+        # browsing past orders) can scroll back and tap a stale main-menu
+        # button from an earlier message. Without this check, that tap would
+        # land in whatever handler the *current* session state maps to,
+        # which doesn't recognize a menu_* id and falls back to
+        # _PLEASE_CHOOSE + re-showing the unrelated in-progress flow --
+        # confusing, and looks like the button is broken (it repeats
+        # identically on a second tap, since the state never changes).
+        # Routing straight to _handle_idle here treats an explicit main-menu
+        # selection as always authoritative, the same "works from any state"
+        # principle RESET_KEYWORDS above already established for free text.
+        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name)
         return
 
     session = sessions.get(tenant_id, phone)
