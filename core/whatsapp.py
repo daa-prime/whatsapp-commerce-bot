@@ -168,7 +168,7 @@ class WhatsAppClient:
         catalog_id: str,
         sections: list[dict],
         body_text: str,
-        header_text: str | None = None,
+        header_text: str,
         footer_text: str | None = None,
     ) -> bool:
         """
@@ -179,9 +179,22 @@ class WhatsAppClient:
         message send_list sends. Requires a catalog to already be linked to
         this phone_number_id's WABA and each product_retailer_id referenced
         below to already be a synced, approved catalog item -- sending this
-        before that's true is expected to fail or render incompletely
-        (unverified against a live payload in this codebase yet, see
-        catalog/feed.py's module docstring).
+        before that's true is expected to fail or render incompletely.
+
+        header_text is required, not optional, unlike send_list/send_buttons'
+        header -- confirmed against Meta's own Cloud API reference
+        (developers.facebook.com/docs/whatsapp/cloud-api/reference/messages):
+        "HeaderObject is Required for 'product_list' type. Cannot be set for
+        'product' type." Meta's Graph API rejects the whole message without
+        one (confirmed against a live payload -- this was missing originally
+        and caused every real send to fail, silently falling back to the
+        list-message flow with no visible error until the fallback's log
+        line was traced back to Meta's actual rejection reason). The header
+        object shape is {"type": "text", "text": header_text} -- same
+        {"type": "text", ...} shape send_buttons already sends for its own
+        header_text, per Meta's HeaderObject schema (also supports an
+        optional "sub_text", not used here, matching how send_buttons/
+        send_list don't use it either).
 
         sections: [{"title": str, "product_items": [{"product_retailer_id": str}, ...]}]
         Meta's real limit here is materially better than send_list's flat
@@ -198,11 +211,10 @@ class WhatsAppClient:
         url = f"{WA_API_BASE}/{self._phone_number_id}/messages"
         interactive = {
             "type": "product_list",
+            "header": {"type": "text", "text": header_text},
             "body": {"text": body_text},
             "action": {"catalog_id": catalog_id, "sections": sections},
         }
-        if header_text:
-            interactive["header"] = {"type": "text", "text": header_text}
         if footer_text:
             interactive["footer"] = {"text": footer_text}
         payload = {

@@ -35,11 +35,12 @@ class FakeWhatsAppClient:
             "to": to, "body_text": body_text, "buttons": buttons, "header_image_url": header_image_url,
         }))
 
-    async def send_product_list(self, to, catalog_id, sections, body_text, header_text=None, footer_text=None):
+    async def send_product_list(self, to, catalog_id, sections, body_text, header_text, footer_text=None):
         if self.fail_product_list:
             return False  # simulated Meta rejection -- nothing actually delivered
         self.sent.append(("product_list", {
             "to": to, "catalog_id": catalog_id, "sections": sections, "body_text": body_text,
+            "header_text": header_text,
         }))
         return True
 
@@ -339,6 +340,9 @@ async def test_shop_sends_native_product_list_when_meta_catalog_id_set(wa, sessi
         item["product_retailer_id"] for section in sent["sections"] for item in section["product_items"]
     }
     assert all_retailer_ids == {product.catalog_retailer_id}
+    # Required by Meta for product_list -- confirmed against a live rejection
+    # ("HeaderObject is Required for 'product_list' type") before this fix.
+    assert sent["header_text"] == db.get_tenant(tenant_id).name
 
 
 @pytest.mark.asyncio

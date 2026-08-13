@@ -140,7 +140,9 @@ async def test_send_product_list_builds_interactive_payload(httpx_mock):
     httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "msg_id"}]})
     client = WhatsAppClient(phone_number_id="123", access_token="token")
     sections = [{"title": "Electronics", "product_items": [{"product_retailer_id": "t1-p1"}]}]
-    await client.send_product_list(to="54911111111", catalog_id="cat_123", sections=sections, body_text="Browse:")
+    await client.send_product_list(
+        to="54911111111", catalog_id="cat_123", sections=sections, body_text="Browse:", header_text="My Store",
+    )
 
     request = httpx_mock.get_requests()[0]
     payload = json.loads(request.content)
@@ -149,6 +151,31 @@ async def test_send_product_list_builds_interactive_payload(httpx_mock):
     assert payload["interactive"]["action"]["catalog_id"] == "cat_123"
     assert payload["interactive"]["action"]["sections"] == sections
     assert payload["interactive"]["body"]["text"] == "Browse:"
+    # Required by Meta for product_list (unlike send_list/send_buttons'
+    # optional header) -- see send_product_list's docstring.
+    assert payload["interactive"]["header"] == {"type": "text", "text": "My Store"}
+
+
+@pytest.mark.asyncio
+async def test_send_product_list_returns_false_on_meta_error_response(httpx_mock):
+    """Reproduces the real failure this whole fix was built around: before
+    this fix, send_product_list never included interactive.header at all,
+    and Meta rejected every real send with exactly this kind of error
+    response (confirmed against production logs) -- silently, since the
+    old code didn't check resp.is_success meaningfully either. This proves
+    the bool-return contract correctly reports False for a genuine Meta
+    rejection, not just a network-level failure."""
+    httpx_mock.add_response(
+        url="https://graph.facebook.com/v22.0/123/messages",
+        status_code=400,
+        json={"error": {"message": "(#100) The parameter interactive['header'] is required.", "code": 100}},
+    )
+    client = WhatsAppClient(phone_number_id="123", access_token="token")
+    sections = [{"title": "Electronics", "product_items": [{"product_retailer_id": "t1-p1"}]}]
+    result = await client.send_product_list(
+        to="54911111111", catalog_id="cat_123", sections=sections, body_text="Browse:", header_text="My Store",
+    )
+    assert result is False
 
 
 def test_parse_incoming_message_unsupported():

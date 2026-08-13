@@ -258,6 +258,7 @@ async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.T
         catalog_id=tenant.meta_catalog_id,
         sections=sections,
         body_text="Browse our products:",
+        header_text=tenant.name,  # required by Meta for product_list -- see send_product_list's docstring
     )
 
 
