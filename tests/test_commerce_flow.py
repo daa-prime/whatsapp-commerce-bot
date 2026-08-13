@@ -22,6 +22,7 @@ PHONE = "919999999999"
 class FakeWhatsAppClient:
     def __init__(self):
         self.sent = []
+        self.fail_product_list = False  # simulates Meta rejecting a native send (e.g. unapproved catalog)
 
     async def send_text(self, to, text):
         self.sent.append(("text", {"to": to, "text": text}))
@@ -35,9 +36,12 @@ class FakeWhatsAppClient:
         }))
 
     async def send_product_list(self, to, catalog_id, sections, body_text, header_text=None, footer_text=None):
+        if self.fail_product_list:
+            return False  # simulated Meta rejection -- nothing actually delivered
         self.sent.append(("product_list", {
             "to": to, "catalog_id": catalog_id, "sections": sections, "body_text": body_text,
         }))
+        return True
 
 
 def tap(option_id, title=""):
@@ -346,6 +350,22 @@ async def test_native_product_list_groups_by_category(wa, sessions, tenant_id):
     await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
     titles = {s["title"] for s in wa.sent[-1][1]["sections"]}
     assert titles == {"Tools", "Apparel"}
+
+
+@pytest.mark.asyncio
+async def test_shop_falls_back_to_list_message_when_native_send_fails(wa, sessions, tenant_id):
+    """meta_catalog_id being set only proves a feed was registered, not
+    that Meta has actually approved every item yet -- a native send can
+    still fail (simulated here via the fake client), and the customer must
+    still get a working list-message browse instead of silence."""
+    db.update_tenant_catalog_and_payment(tenant_id, meta_catalog_id="cat_123")
+    _make_product(tenant_id, name="Widget", price="10.00")
+    wa.fail_product_list = True
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_shop"))
+
+    assert wa.sent[-1][0] == "list"  # fell back successfully, not silence
+    assert not any(kind == "product_list" for kind, _ in wa.sent)  # the failed attempt was never "sent"
 
 
 def test_get_product_by_retailer_id_resolves_and_isolates_by_tenant(tenant_id, second_tenant_id):

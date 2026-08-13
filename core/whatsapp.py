@@ -170,7 +170,7 @@ class WhatsAppClient:
         body_text: str,
         header_text: str | None = None,
         footer_text: str | None = None,
-    ) -> None:
+    ) -> bool:
         """
         Send a WhatsApp multi-product message (interactive.type
         "product_list") -- Meta's native catalog browsing UI: real product
@@ -186,6 +186,13 @@ class WhatsAppClient:
         sections: [{"title": str, "product_items": [{"product_retailer_id": str}, ...]}]
         Meta's real limit here is materially better than send_list's flat
         10-row cap: up to 30 items across up to 10 sections.
+
+        Unlike send_text/send_list/send_buttons, this returns a bool rather
+        than None -- callers (core/commerce_flow.py's _send_product_list)
+        need to know whether the native send actually landed so they can
+        fall back to the list-message flow if it didn't, rather than the
+        customer getting silence. A catalog not yet approved/ingested by
+        Meta is exactly the failure case this exists for.
         """
         to = normalize_phone(to)
         url = f"{WA_API_BASE}/{self._phone_number_id}/messages"
@@ -209,11 +216,13 @@ class WhatsAppClient:
             resp = await self._client.post(url, json=payload, headers=self._headers)
         except httpx.HTTPError:
             logger.exception("WhatsApp send_product_list request to %s failed (network/transport error)", url)
-            return
+            return False
         if resp.is_success:
             logger.info("WhatsApp send_product_list: %s OK for %s", resp.status_code, to)
+            return True
         else:
             logger.error("WhatsApp send_product_list error %s: %s", resp.status_code, resp.text)
+            return False
 
 
 def parse_incoming_message(message: dict) -> dict:

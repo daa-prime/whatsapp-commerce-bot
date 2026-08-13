@@ -214,7 +214,7 @@ _MAX_NATIVE_PRODUCTS = 30  # Meta's product_list cap: up to 30 items across up t
 _MAX_NATIVE_SECTIONS = 10
 
 
-async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.Tenant, products: list[db.Product]) -> None:
+async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.Tenant, products: list[db.Product]) -> bool:
     """Meta's native multi-product message (core/whatsapp.py's
     send_product_list) -- real product cards with images and full names,
     rendered by WhatsApp itself from the catalog linked to tenant.
@@ -229,7 +229,15 @@ async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.T
     products" row to inject. A tenant with more active products than that
     only sees the first 30 (first-appearance category order) via native
     browsing today -- a known scope limit, not solved here, same as this
-    module's other explicitly-flagged deliberate scope cuts."""
+    module's other explicitly-flagged deliberate scope cuts.
+
+    Returns whatever wa.send_product_list() reports -- True if Meta
+    accepted the send, False otherwise -- so _send_product_list below can
+    fall back to the list-message flow rather than leaving the customer
+    with silence. tenant.meta_catalog_id being set only proves a feed was
+    *registered*, not that Meta has actually ingested/approved every item
+    yet (catalog/feed.py's module docstring); this is exactly the failure
+    case that gap produces."""
     grouped = _group_products_by_category(products)
     sections = []
     remaining = _MAX_NATIVE_PRODUCTS
@@ -245,7 +253,7 @@ async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.T
         })
         remaining -= len(window)
 
-    await wa.send_product_list(
+    return await wa.send_product_list(
         to=phone,
         catalog_id=tenant.meta_catalog_id,
         sections=sections,
@@ -290,8 +298,19 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
 
     tenant = db.get_tenant(tenant_id)
     if tenant and tenant.meta_catalog_id:
-        await _send_native_product_list(wa, phone, tenant, products)
-        return True
+        sent_native = await _send_native_product_list(wa, phone, tenant, products)
+        if sent_native:
+            return True
+        # Native send failed (e.g. Meta hasn't finished approving the
+        # catalog/feed items yet, even though meta_catalog_id is set) --
+        # fall through to the list-message flow below instead of leaving
+        # the customer with silence. Same graceful-degradation principle
+        # already used for a WhatsApp send failure elsewhere in this app
+        # (Phase 8's delivery-failure handling) -- a failed native send is
+        # never the end of the conversation.
+        logger.warning(
+            "Native product_list send failed for tenant_id=%s, falling back to list-message flow", tenant_id,
+        )
 
     grouped = _group_products_by_category(products)
     flat = [p for _, plist in grouped for p in plist]
