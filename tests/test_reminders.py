@@ -34,9 +34,9 @@ def _backdate_order(tenant_id, order_id, hours_ago):
     conn.commit()
 
 
-def _abandoned_order(tenant_id, phone=PHONE, hours_ago=5, payment_link_url=None):
+def _abandoned_order(tenant_id, phone=PHONE, hours_ago=5, payment_link_url=None, language="en"):
     order = db.create_order(tenant_id, customer_phone=phone, status=db.ORDER_STATUS_PENDING_PAYMENT,
-                             subtotal=Decimal("199.00"), total=Decimal("199.00"))
+                             subtotal=Decimal("199.00"), total=Decimal("199.00"), language=language)
     if payment_link_url:
         db.update_order_payment_link(tenant_id, order.id, payment_link_url, "plink_xxx")
     _backdate_order(tenant_id, order.id, hours_ago)
@@ -136,3 +136,16 @@ async def test_respects_tenant_specific_nudge_threshold(wa, tenant_id):
 @pytest.mark.asyncio
 async def test_unknown_tenant_returns_zero(wa):
     assert await send_abandoned_cart_nudges(wa, 999999) == 0
+
+
+@pytest.mark.asyncio
+async def test_nudge_uses_order_language_not_default(wa, tenant_id):
+    """order.language is snapshotted at checkout (core/commerce_flow.py) --
+    this job runs on an external cron trigger, often long after the
+    customer's conversation session expired, so there's no live session to
+    read a language preference from."""
+    _abandoned_order(tenant_id, hours_ago=5, language="hi")
+
+    await send_abandoned_cart_nudges(wa, tenant_id)
+
+    assert "अभी भी लंबित है" in wa.sent[0][1]["text"]

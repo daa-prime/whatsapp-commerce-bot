@@ -19,21 +19,22 @@ asked for.
 import logging
 
 import db.repository as db
+from core.strings import t
 from core.whatsapp import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 
 
 def _nudge_message(order: db.Order) -> str:
+    """order.language (snapshotted at checkout, core/commerce_flow.py's
+    _complete_checkout_from_cart) is used here for the same reason
+    core/commerce_flow.py's payment-webhook handlers use it -- this job
+    runs on an external cron trigger, potentially days after the customer's
+    conversation session expired, so there's no live session to read a
+    language preference from."""
     if order.payment_link_url:
-        return (
-            f"You still have an order waiting — order #{order.id}. "
-            f"Complete your payment here to confirm it: {order.payment_link_url}"
-        )
-    return (
-        f"You still have an order waiting — order #{order.id}. "
-        "Send us a message to complete your checkout."
-    )
+        return t("nudge_with_link", order.language, id=order.id, url=order.payment_link_url)
+    return t("nudge_without_link", order.language, id=order.id)
 
 
 async def send_abandoned_cart_nudges(wa: WhatsAppClient, tenant_id: int) -> int:

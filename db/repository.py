@@ -394,6 +394,7 @@ class Order:
     paid_at: str | None
     nudge_sent_at: str | None
     payment_method: str | None  # e.g. "upi"/"card"/"netbanking"/"wallet" (payments.py); NULL until paid
+    language: str  # core/strings.py's LANG_EN/LANG_HI, snapshotted at checkout -- see schema.sql's column comment
 
 
 def _row_to_order(row) -> Order:
@@ -410,6 +411,7 @@ def _row_to_order(row) -> Order:
         paid_at=row["paid_at"],
         nudge_sent_at=row["nudge_sent_at"],
         payment_method=row["payment_method"],
+        language=row["language"],
     )
 
 
@@ -457,15 +459,20 @@ def create_order(
     status: str = ORDER_STATUS_BROWSING,
     subtotal: Decimal | None = None,
     total: Decimal | None = None,
+    language: str = "en",
 ) -> Order:
     """Defaults to ORDER_STATUS_BROWSING -- an order row can exist before any
     line items or pricing are known yet (SPEC.md Section 4's conversation_sessions
-    note), which is why subtotal/total are optional here."""
+    note), which is why subtotal/total are optional here.
+
+    language: snapshots the customer's chosen conversation language at
+    creation time (core/strings.py) -- see schema.sql's column comment for
+    why this can't just be looked up later from session context."""
     conn = get_connection()
     cur = conn.execute(
-        "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total) "
-        "VALUES (?, ?, ?, ?, ?) RETURNING id",
-        (tenant_id, customer_phone, status, subtotal, total),
+        "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total, language) "
+        "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+        (tenant_id, customer_phone, status, subtotal, total, language),
     )
     new_id = cur.fetchone()["id"]
     conn.commit()
@@ -568,6 +575,7 @@ def checkout_cart(
     customer_phone: str,
     cart: dict[str, int],
     conn=None,
+    language: str = "en",
 ) -> tuple[Order | None, list[str]]:
     """Atomically checks stock, decrements it, and creates the order +
     order_items for a customer's cart in a single DB transaction (core/
@@ -620,9 +628,9 @@ def checkout_cart(
 
         subtotal = sum((price * qty for _, qty, price in line_items), Decimal("0"))
         order_row = conn.execute(
-            "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total) "
-            "VALUES (?, ?, ?, ?, ?) RETURNING id",
-            (tenant_id, customer_phone, ORDER_STATUS_PENDING_PAYMENT, subtotal, subtotal),
+            "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total, language) "
+            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+            (tenant_id, customer_phone, ORDER_STATUS_PENDING_PAYMENT, subtotal, subtotal, language),
         ).fetchone()
         order_id = order_row["id"]
 

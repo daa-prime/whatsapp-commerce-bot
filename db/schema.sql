@@ -169,6 +169,16 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS nudge_sent_at TEXT;
 -- by the merchant portal's dashboard payment-method breakdown.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT;
 
+-- Snapshots the customer's chosen conversation language (core/strings.py's
+-- LANG_EN/LANG_HI) at checkout time -- same "snapshot at creation, don't
+-- look it up later" reasoning as unit_price_at_order_time. Needed because
+-- handle_payment_success/handle_payment_failure (core/commerce_flow.py) are
+-- triggered by Razorpay's webhook, often well after the customer's
+-- conversation session has expired (30-min timeout) -- by the time payment
+-- happens there may be no session context left to read a language
+-- preference from, but the order row itself persists indefinitely.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
+
 -- tenant_id is included directly here (not just reachable via order_id ->
 -- orders.tenant_id) for the same reason the hospital schema's
 -- appointment_reminders carried hospital_id alongside appointment_id: every

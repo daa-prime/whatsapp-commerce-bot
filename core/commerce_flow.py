@@ -17,6 +17,19 @@ rule the old booking_flow.py followed. Every db call and every session store
 call here is scoped by tenant_id, resolved per-message in core/main.py from the
 incoming webhook's phone_number_id.
 
+Language: every fixed bot-facing string is translated (English/Hindi,
+core/strings.py) -- merchant-configured content (business name, product
+names/descriptions) is never auto-translated, only the bot's own UI text.
+The customer's chosen language lives in context["language"], the same
+session-context bag as everything else (cart, shop_offset, ...) -- it rides
+along for free through every handler's existing `{**context, ...}` merges.
+A brand-new conversation (no language chosen yet) sees a language-choice
+button message before the main menu; a *reset* (RESET_KEYWORDS, a stale
+main-menu tap, any unrecognized-state fallback) preserves whatever language
+was already chosen rather than re-asking -- only a conversation that never
+had one picked (or one that expired via the 30-min session timeout, which
+discards context entirely) sees the prompt again. See _handle_idle.
+
 Reused-vs-rebuilt note: the brief for this module asked to port over three
 CareConnect-lineage patterns (a _cap_rows() 10-row helper, free-text
 reset-keyword handling, and a "Talk to Reception" human-handoff flow) rather
@@ -42,16 +55,26 @@ from decimal import Decimal
 
 import payments
 import db.repository as db
+from core.strings import DEFAULT_LANG, LANG_EN, LANG_HI, LANGUAGE_NAMES, status_label, t
 from core.whatsapp import WhatsAppClient
 
 logger = logging.getLogger(__name__)
 
 MAX_LIST_ROWS = 10  # Meta's per-message cap (core/whatsapp.py's send_list docstring)
 
+STATE_IDLE = "IDLE"  # matches core/history.py's DEFAULT_STATE -- see _handle_idle
+
 # Free-text shortcuts that reset the conversation to the main menu from
 # *any* state, not just IDLE -- e.g. mid-shopping, typing "menu" bails out
-# without needing to tap through "Back" options.
-RESET_KEYWORDS = {"hi", "hello", "hey", "menu", "restart", "start"}
+# without needing to tap through "Back" options. Hindi equivalents included
+# so this works the same way regardless of which language a customer is
+# typing in -- these are recognized independent of the session's chosen
+# language (checked before we necessarily know it, e.g. on a customer's
+# very first message).
+RESET_KEYWORDS = {
+    "hi", "hello", "hey", "menu", "restart", "start",
+    "नमस्ते", "मेनू", "शुरू", "हाय",
+}
 
 STATE_SHOP_LIST = "SHOP_LIST"
 STATE_PRODUCT_DETAIL = "PRODUCT_DETAIL"
@@ -67,31 +90,15 @@ MENU_OFFERS = "menu_offers"
 MENU_ACCOUNT = "menu_account"
 MENU_TALK_TO_US = "menu_talk_to_us"
 
+LANG_EN_BTN = "lang_en"
+LANG_HI_BTN = "lang_hi"
+
 # Main-menu button taps are recognized from *any* session state, not just
 # IDLE (see handle_incoming) -- WhatsApp keeps old interactive messages
 # tappable indefinitely, so a customer mid-flow can tap a stale main-menu
 # button from an earlier message; without this, that tap would be
 # misrouted into whatever handler the *current* state maps to instead.
 _MAIN_MENU_IDS = {MENU_SHOP, MENU_MY_ORDERS, MENU_TRACK_ORDER, MENU_OFFERS, MENU_ACCOUNT, MENU_TALK_TO_US}
-
-SHOP_MORE = "shop_more"
-ADD_TO_CART = "add_to_cart"
-BACK_TO_PRODUCTS = "back_to_products"
-VIEW_CART = "view_cart"
-CONTINUE_SHOPPING = "continue_shopping"
-CHECKOUT = "checkout"
-MAIN_MENU_BTN = "main_menu"
-
-_PLEASE_CHOOSE = "Please choose an option from the list above"
-
-_STATUS_LABELS = {
-    db.ORDER_STATUS_BROWSING: "Browsing",
-    db.ORDER_STATUS_PENDING_PAYMENT: "Pending Payment",
-    db.ORDER_STATUS_PAID: "Paid",
-    db.ORDER_STATUS_FAILED: "Failed",
-    db.ORDER_STATUS_CANCELLED: "Cancelled",
-    db.ORDER_STATUS_FULFILLED: "Fulfilled",
-}
 
 
 # --- Small formatting/helper utilities ---
@@ -173,20 +180,34 @@ def _cart_subtotal(tenant_id: int, cart: dict) -> Decimal:
 
 # --- Outgoing message builders ---
 
-async def _send_main_menu(wa: WhatsAppClient, phone: str, tenant_name: str) -> None:
+async def _send_language_prompt(wa: WhatsAppClient, phone: str) -> None:
+    """Shown once per genuinely new conversation, before the main menu --
+    necessarily bilingual (not looked up via core.strings.t) since we don't
+    know the customer's language yet; that's the whole point of asking."""
+    await wa.send_buttons(
+        to=phone,
+        body_text="Please select your language / कृपया अपनी भाषा चुनें",
+        buttons=[
+            {"id": LANG_EN_BTN, "title": LANGUAGE_NAMES[LANG_EN]},
+            {"id": LANG_HI_BTN, "title": LANGUAGE_NAMES[LANG_HI]},
+        ],
+    )
+
+
+async def _send_main_menu(wa: WhatsAppClient, phone: str, tenant_name: str, lang: str) -> None:
     rows = [
-        {"id": MENU_SHOP, "title": "Shop Now"},
-        {"id": MENU_MY_ORDERS, "title": "My Orders"},
-        {"id": MENU_TRACK_ORDER, "title": "Track Order"},
-        {"id": MENU_OFFERS, "title": "Offers"},
-        {"id": MENU_ACCOUNT, "title": "Account"},
-        {"id": MENU_TALK_TO_US, "title": "Talk to Us"},
+        {"id": MENU_SHOP, "title": t("menu_shop_now", lang)},
+        {"id": MENU_MY_ORDERS, "title": t("menu_my_orders", lang)},
+        {"id": MENU_TRACK_ORDER, "title": t("menu_track_order", lang)},
+        {"id": MENU_OFFERS, "title": t("menu_offers", lang)},
+        {"id": MENU_ACCOUNT, "title": t("menu_account", lang)},
+        {"id": MENU_TALK_TO_US, "title": t("menu_talk_to_us", lang)},
     ]
     await wa.send_list(
         to=phone,
-        body_text=f"Hi! Welcome to {tenant_name}. What would you like to do?",
-        button_text="Main Menu",
-        sections=[{"title": "Main Menu", "rows": rows}],
+        body_text=t("welcome", lang, tenant_name=tenant_name),
+        button_text=t("main_menu_button", lang),
+        sections=[{"title": t("main_menu_button", lang), "rows": rows}],
     )
 
 
@@ -204,8 +225,10 @@ def _group_products_by_category(products: list[db.Product]) -> list[tuple[str, l
     order. Categories are ordered by first appearance in that same order --
     not alphabetically -- so a merchant's catalog order isn't reshuffled just
     because "Accessories" sorts before "Widgets". Blank/NULL category
-    (products.category is optional, SPEC.md Section 4) becomes "Other" rather
-    than a nameless section."""
+    (products.category is optional, SPEC.md Section 4) becomes the internal
+    "Other" grouping key -- a stable, language-independent key; callers
+    translate it for display (only this fallback needs translation, real
+    merchant-set category names never do -- see _category_display_label)."""
     groups: dict[str, list[db.Product]] = {}
     order: list[str] = []
     for p in products:
@@ -217,11 +240,19 @@ def _group_products_by_category(products: list[db.Product]) -> list[tuple[str, l
     return [(label, groups[label]) for label in order]
 
 
+def _category_display_label(label: str, lang: str) -> str:
+    """Translates only the "Other" fallback grouping key -- real merchant-set
+    category names are content, not UI chrome, and are never auto-translated."""
+    return t("category_other", lang) if label == "Other" else label
+
+
 _MAX_NATIVE_PRODUCTS = 30  # Meta's product_list cap: up to 30 items across up to 10 sections
 _MAX_NATIVE_SECTIONS = 10
 
 
-async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.Tenant, products: list[db.Product]) -> bool:
+async def _send_native_product_list(
+    wa: WhatsAppClient, phone: str, tenant: db.Tenant, products: list[db.Product], lang: str,
+) -> bool:
     """Meta's native multi-product message (core/whatsapp.py's
     send_product_list) -- real product cards with images and full names,
     rendered by WhatsApp itself from the catalog linked to tenant.
@@ -255,7 +286,7 @@ async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.T
         if not window:
             continue
         sections.append({
-            "title": label[:24],
+            "title": _category_display_label(label, lang)[:24],
             "product_items": [{"product_retailer_id": p.catalog_retailer_id} for p in window],
         })
         remaining -= len(window)
@@ -264,12 +295,12 @@ async def _send_native_product_list(wa: WhatsAppClient, phone: str, tenant: db.T
         to=phone,
         catalog_id=tenant.meta_catalog_id,
         sections=sections,
-        body_text="Browse our products:",
+        body_text=t("browse_products_body", lang),
         header_text=tenant.name,  # required by Meta for product_list -- see send_product_list's docstring
     )
 
 
-async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, offset: int) -> bool:
+async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, offset: int, lang: str) -> bool:
     """Sends the product list page starting at `offset`. Returns False
     (sends nothing) if the tenant has no active products at all -- callers
     handle that as an empty-catalog case, not an error.
@@ -306,7 +337,7 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
 
     tenant = db.get_tenant(tenant_id)
     if tenant and tenant.meta_catalog_id:
-        sent_native = await _send_native_product_list(wa, phone, tenant, products)
+        sent_native = await _send_native_product_list(wa, phone, tenant, products, lang)
         if sent_native:
             return True
         # Native send failed (e.g. Meta hasn't finished approving the
@@ -325,7 +356,7 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
 
     window = flat[offset:offset + MAX_LIST_ROWS]
     has_more = offset + MAX_LIST_ROWS < len(flat)
-    more_row = {"id": SHOP_MORE, "title": "See more products"} if has_more else None
+    more_row = {"id": SHOP_MORE, "title": t("see_more_products", lang)} if has_more else None
     limit = MAX_LIST_ROWS - 1 if more_row is not None else MAX_LIST_ROWS
     capped_ids = {p.id for p in window[:limit]}
 
@@ -333,20 +364,20 @@ async def _send_product_list(wa: WhatsAppClient, phone: str, tenant_id: int, off
     for label, plist in grouped:
         rows = [_product_row(p) for p in plist if p.id in capped_ids]
         if rows:
-            sections.append({"title": label[:24], "rows": rows})
+            sections.append({"title": _category_display_label(label, lang)[:24], "rows": rows})
     if more_row is not None:
-        sections.append({"title": "More", "rows": [more_row]})
+        sections.append({"title": t("category_more_section", lang), "rows": [more_row]})
 
     await wa.send_list(
         to=phone,
-        body_text="Browse our products:",
-        button_text="View Products",
+        body_text=t("browse_products_body", lang),
+        button_text=t("view_products_button", lang),
         sections=sections,
     )
     return True
 
 
-async def _send_product_detail(wa: WhatsAppClient, phone: str, product: db.Product) -> None:
+async def _send_product_detail(wa: WhatsAppClient, phone: str, product: db.Product, lang: str) -> None:
     body = f"{product.name}\n{_fmt_money(product.price)}"
     if product.description:
         body += f"\n\n{product.description}"
@@ -355,29 +386,36 @@ async def _send_product_detail(wa: WhatsAppClient, phone: str, product: db.Produ
         body_text=body,
         header_image_url=product.image_url or None,
         buttons=[
-            {"id": ADD_TO_CART, "title": "Add to Cart"},
-            {"id": BACK_TO_PRODUCTS, "title": "Back to Products"},
+            {"id": ADD_TO_CART, "title": t("add_to_cart_button", lang)},
+            {"id": BACK_TO_PRODUCTS, "title": t("back_to_products_button", lang)},
         ],
     )
 
 
-async def _send_add_to_cart_prompt(wa: WhatsAppClient, phone: str, product_name: str, cart: dict, tenant_id: int) -> None:
+def _cart_count_summary(cart: dict, tenant_id: int, lang: str) -> str:
     total_qty = sum(cart.values())
     subtotal = _cart_subtotal(tenant_id, cart)
+    unit = "item" if total_qty == 1 else "items"  # only referenced by the English template
+    return t("cart_count_summary", lang, count=total_qty, unit=unit, amount=_fmt_money(subtotal))
+
+
+async def _send_add_to_cart_prompt(
+    wa: WhatsAppClient, phone: str, product_name: str, cart: dict, tenant_id: int, lang: str,
+) -> None:
     await wa.send_buttons(
         to=phone,
         body_text=(
-            f"Added {product_name} to your cart.\n\n"
-            f"Cart ({total_qty} item{'s' if total_qty != 1 else ''}) — {_fmt_money(subtotal)}"
+            f"{t('added_to_cart', lang, product_name=product_name)}\n\n"
+            f"{_cart_count_summary(cart, tenant_id, lang)}"
         ),
         buttons=[
-            {"id": VIEW_CART, "title": "View Cart"},
-            {"id": CONTINUE_SHOPPING, "title": "Continue Shopping"},
+            {"id": VIEW_CART, "title": t("view_cart_button", lang)},
+            {"id": CONTINUE_SHOPPING, "title": t("continue_shopping_button", lang)},
         ],
     )
 
 
-async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict) -> bool:
+async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict, lang: str) -> bool:
     """Returns False (sends an "empty cart" text instead) if the cart has no
     items -- can happen if every product in it was deactivated since being
     added."""
@@ -392,22 +430,25 @@ async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict)
         lines.append(f"{qty} x {product.name} — {_fmt_money(line_total)}")
 
     if not lines:
-        await wa.send_text(phone, "Your cart is empty.")
+        await wa.send_text(phone, t("cart_empty", lang))
         return False
 
-    body = "Your Cart:\n\n" + "\n".join(lines) + f"\n\nSubtotal: {_fmt_money(subtotal)}"
+    body = (
+        f"{t('your_cart_header', lang)}\n\n" + "\n".join(lines)
+        + f"\n\n{t('subtotal_label', lang, amount=_fmt_money(subtotal))}"
+    )
     await wa.send_buttons(
         to=phone,
         body_text=body,
         buttons=[
-            {"id": CHECKOUT, "title": "Checkout"},
-            {"id": CONTINUE_SHOPPING, "title": "Continue Shopping"},
+            {"id": CHECKOUT, "title": t("checkout_button", lang)},
+            {"id": CONTINUE_SHOPPING, "title": t("continue_shopping_button", lang)},
         ],
     )
     return True
 
 
-async def _send_orders_list(wa: WhatsAppClient, phone: str, tenant_id: int, customer_phone: str) -> bool:
+async def _send_orders_list(wa: WhatsAppClient, phone: str, tenant_id: int, customer_phone: str, lang: str) -> bool:
     """Returns False (sends nothing) if the customer has no orders at this
     tenant yet. get_orders_for_phone already sorts most-recent-first, so
     capping at MAX_LIST_ROWS naturally keeps the soonest/most recent ones --
@@ -421,21 +462,21 @@ async def _send_orders_list(wa: WhatsAppClient, phone: str, tenant_id: int, cust
     rows = _cap_rows([
         {
             "id": _order_row_id(o.id),
-            "title": f"Order #{o.id}",
-            "description": f"{_STATUS_LABELS.get(o.status, o.status)} — {_fmt_money(o.total)}",
+            "title": t("order_number", lang, id=o.id),
+            "description": f"{status_label(o.status, lang)} — {_fmt_money(o.total)}",
         }
         for o in orders
     ])
     await wa.send_list(
         to=phone,
-        body_text="Your recent orders:",
-        button_text="View Orders",
-        sections=[{"title": "Orders", "rows": rows}],
+        body_text=t("your_recent_orders", lang),
+        button_text=t("view_orders_button", lang),
+        sections=[{"title": t("orders_section_title", lang), "rows": rows}],
     )
     return True
 
 
-async def _send_order_detail(wa: WhatsAppClient, phone: str, tenant_id: int, order: db.Order) -> None:
+async def _send_order_detail(wa: WhatsAppClient, phone: str, tenant_id: int, order: db.Order, lang: str) -> None:
     items = db.get_order_items(tenant_id, order.id)
     lines = []
     for item in items:
@@ -443,37 +484,46 @@ async def _send_order_detail(wa: WhatsAppClient, phone: str, tenant_id: int, ord
         lines.append(f"{item.quantity} x {name} — {_fmt_money(item.unit_price_at_order_time * item.quantity)}")
 
     body = (
-        f"Order #{order.id}\n"
-        f"Status: {_STATUS_LABELS.get(order.status, order.status)}\n"
-        f"Placed: {_fmt_datetime(order.created_at)}\n\n"
+        f"{t('order_number', lang, id=order.id)}\n"
+        f"{t('order_status_label', lang, status=status_label(order.status, lang))}\n"
+        f"{t('order_placed_label', lang, date=_fmt_datetime(order.created_at))}\n\n"
         + "\n".join(lines)
-        + f"\n\nTotal: {_fmt_money(order.total)}"
+        + f"\n\n{t('order_total_label', lang, amount=_fmt_money(order.total))}"
     )
     await wa.send_buttons(
         to=phone,
         body_text=body,
-        buttons=[{"id": MAIN_MENU_BTN, "title": "Main Menu"}],
+        buttons=[{"id": MAIN_MENU_BTN, "title": t("main_menu_button", lang)}],
     )
+
+
+SHOP_MORE = "shop_more"
+ADD_TO_CART = "add_to_cart"
+BACK_TO_PRODUCTS = "back_to_products"
+VIEW_CART = "view_cart"
+CONTINUE_SHOPPING = "continue_shopping"
+CHECKOUT = "checkout"
+MAIN_MENU_BTN = "main_menu"
 
 
 # --- Flow starters (called from IDLE) ---
 
-async def _start_shop(wa: WhatsAppClient, sessions, phone: str, tenant_id: int) -> None:
-    sent = await _send_product_list(wa, phone, tenant_id, 0)
+async def _start_shop(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, lang: str) -> None:
+    sent = await _send_product_list(wa, phone, tenant_id, 0, lang)
     if not sent:
-        sessions.reset(tenant_id, phone)
-        await wa.send_text(phone, "Sorry, we don't have any products available right now.")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await wa.send_text(phone, t("no_products_available", lang))
         return
-    sessions.set(tenant_id, phone, STATE_SHOP_LIST, {"shop_offset": 0, "cart": {}})
+    sessions.set(tenant_id, phone, STATE_SHOP_LIST, {"language": lang, "shop_offset": 0, "cart": {}})
 
 
-async def _start_orders_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int) -> None:
-    sent = await _send_orders_list(wa, phone, tenant_id, phone)
+async def _start_orders_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, lang: str) -> None:
+    sent = await _send_orders_list(wa, phone, tenant_id, phone, lang)
     if not sent:
-        sessions.reset(tenant_id, phone)
-        await wa.send_text(phone, "You don't have any orders yet.")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await wa.send_text(phone, t("no_orders_yet", lang))
         return
-    sessions.set(tenant_id, phone, STATE_ORDER_LIST, {})
+    sessions.set(tenant_id, phone, STATE_ORDER_LIST, {"language": lang})
 
 
 # --- State handlers ---
@@ -481,34 +531,63 @@ async def _start_orders_list(wa: WhatsAppClient, sessions, phone: str, tenant_id
 # or refreshes the session at the *same* state (on free text/unsupported
 # input), same pattern as the old booking_flow.py.
 
-async def _handle_idle(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, tenant_name: str) -> None:
+async def _handle_idle(
+    wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, tenant_name: str, context: dict,
+) -> None:
+    """Handles IDLE -- including the language-selection step, which lives
+    here rather than as a separate dispatched state: IDLE-with-no-language
+    and IDLE-with-a-language are really the same state from the session
+    store's point of view (both land here via handle_incoming's "unhandled
+    state" fallback), just with different context. This is also the target
+    every "go back to idle" path in this module routes through (RESET_KEYWORDS,
+    a stale main-menu tap from another state, a completed/abandoned flow),
+    so language-preservation logic only has to live in one place."""
+    lang = context.get("language")
+
+    if reply["type"] == "interactive_reply" and reply["id"] in (LANG_EN_BTN, LANG_HI_BTN):
+        chosen = LANG_EN if reply["id"] == LANG_EN_BTN else LANG_HI
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": chosen})
+        await _send_main_menu(wa, phone, tenant_name, chosen)
+        return
+
+    if lang is None:
+        # No language chosen yet for this conversation -- always (re-)show
+        # the prompt regardless of what was tapped/typed, until one is
+        # picked. Covers first contact, a reset with no prior language, and
+        # any stray input while the prompt is still pending.
+        sessions.set(tenant_id, phone, STATE_IDLE, {})
+        await _send_language_prompt(wa, phone)
+        return
+
     if reply["type"] == "interactive_reply":
         rid = reply["id"]
         if rid == MENU_SHOP:
-            await _start_shop(wa, sessions, phone, tenant_id)
+            await _start_shop(wa, sessions, phone, tenant_id, lang)
             return
         if rid in (MENU_MY_ORDERS, MENU_TRACK_ORDER):
-            await _start_orders_list(wa, sessions, phone, tenant_id)
+            await _start_orders_list(wa, sessions, phone, tenant_id, lang)
             return
         if rid == MENU_OFFERS:
-            sessions.reset(tenant_id, phone)
-            await wa.send_text(phone, "Offers are coming soon!")
+            sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+            await wa.send_text(phone, t("offers_coming_soon", lang))
             return
         if rid == MENU_ACCOUNT:
-            sessions.reset(tenant_id, phone)
-            await wa.send_text(phone, "Account management is coming soon!")
+            sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+            await wa.send_text(phone, t("account_coming_soon", lang))
             return
         if rid == MENU_TALK_TO_US:
-            sessions.reset(tenant_id, phone)
-            await wa.send_text(phone, "Talk to Us is coming soon — for now, please reach out to us directly.")
+            sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+            await wa.send_text(phone, t("talk_to_us_coming_soon", lang))
             return
-    # Any other message while IDLE (first contact, free text, stale/unknown id):
-    # always responds with the welcome message + main menu.
-    sessions.reset(tenant_id, phone)
-    await _send_main_menu(wa, phone, tenant_name)
+
+    # Any other message while IDLE (free text, stale/unknown id): always
+    # responds with the welcome message + main menu, in the already-chosen language.
+    sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+    await _send_main_menu(wa, phone, tenant_name, lang)
 
 
 async def _handle_shop_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     if reply["type"] == "interactive_reply":
         rid = reply["id"]
         if rid == SHOP_MORE:
@@ -517,7 +596,7 @@ async def _handle_shop_list(wa: WhatsAppClient, sessions, phone: str, tenant_id:
             if next_offset >= len(products):
                 next_offset = 0
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, {**context, "shop_offset": next_offset})
-            await _send_product_list(wa, phone, tenant_id, next_offset)
+            await _send_product_list(wa, phone, tenant_id, next_offset, lang)
             return
 
         product_id = _parse_product_row_id(rid)
@@ -525,40 +604,41 @@ async def _handle_shop_list(wa: WhatsAppClient, sessions, phone: str, tenant_id:
             product = db.get_product(tenant_id, product_id)
             if product and product.is_active:
                 sessions.set(tenant_id, phone, STATE_PRODUCT_DETAIL, {**context, "product_id": product.id})
-                await _send_product_detail(wa, phone, product)
+                await _send_product_detail(wa, phone, product, lang)
                 return
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-            await wa.send_text(phone, "Sorry, that item is no longer available.")
-            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+            await wa.send_text(phone, t("item_unavailable", lang))
+            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
             return
 
     sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
-    await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+    await wa.send_text(phone, t("please_choose", lang))
+    await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
 
 
 async def _handle_product_detail(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     product_id = context.get("product_id")
     if product_id is None:
         # Corrupted/incomplete session context -- fail safe back to the main
         # menu, same "the store" fallback name booking_flow.py used ("the
         # hospital") for this exact class of defensive case.
-        sessions.reset(tenant_id, phone)
-        await _send_main_menu(wa, phone, "the store")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await _send_main_menu(wa, phone, "the store", lang)
         return
 
     if reply["type"] == "interactive_reply":
         rid = reply["id"]
         if rid == BACK_TO_PRODUCTS:
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
             return
         if rid == ADD_TO_CART:
             product = db.get_product(tenant_id, product_id)
             if not product or not product.is_active:
                 sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-                await wa.send_text(phone, "Sorry, that item is no longer available.")
-                await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+                await wa.send_text(phone, t("item_unavailable", lang))
+                await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
                 return
 
             cart = dict(context.get("cart", {}))
@@ -571,71 +651,71 @@ async def _handle_product_detail(wa: WhatsAppClient, sessions, phone: str, tenan
             if requested_qty > product.stock_quantity:
                 sessions.set(tenant_id, phone, STATE_PRODUCT_DETAIL, context)
                 if product.stock_quantity <= 0:
-                    await wa.send_text(phone, "Sorry, this item is out of stock.")
+                    await wa.send_text(phone, t("out_of_stock", lang))
                 else:
-                    await wa.send_text(phone, f"Sorry, only {product.stock_quantity} left in stock.")
-                await _send_product_detail(wa, phone, product)
+                    await wa.send_text(phone, t("only_n_left", lang, n=product.stock_quantity))
+                await _send_product_detail(wa, phone, product, lang)
                 return
 
             cart[key] = requested_qty
             new_context = {**context, "cart": cart}
             sessions.set(tenant_id, phone, STATE_POST_ADD, new_context)
-            await _send_add_to_cart_prompt(wa, phone, product.name, cart, tenant_id)
+            await _send_add_to_cart_prompt(wa, phone, product.name, cart, tenant_id, lang)
             return
 
     sessions.set(tenant_id, phone, STATE_PRODUCT_DETAIL, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
+    await wa.send_text(phone, t("please_choose", lang))
     product = db.get_product(tenant_id, product_id)
     if product:
-        await _send_product_detail(wa, phone, product)
+        await _send_product_detail(wa, phone, product, lang)
 
 
 async def _handle_post_add(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     if reply["type"] == "interactive_reply":
         rid = reply["id"]
         if rid == VIEW_CART:
             sessions.set(tenant_id, phone, STATE_CART, context)
-            await _send_cart(wa, phone, tenant_id, context.get("cart", {}))
+            await _send_cart(wa, phone, tenant_id, context.get("cart", {}), lang)
             return
         if rid == CONTINUE_SHOPPING:
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
             return
 
     sessions.set(tenant_id, phone, STATE_POST_ADD, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
+    await wa.send_text(phone, t("please_choose", lang))
     cart = context.get("cart", {})
     # Re-send the same view/continue prompt with an up-to-date cart summary.
-    total_qty = sum(cart.values())
-    subtotal = _cart_subtotal(tenant_id, cart)
     await wa.send_buttons(
         to=phone,
-        body_text=f"Cart ({total_qty} item{'s' if total_qty != 1 else ''}) — {_fmt_money(subtotal)}",
+        body_text=_cart_count_summary(cart, tenant_id, lang),
         buttons=[
-            {"id": VIEW_CART, "title": "View Cart"},
-            {"id": CONTINUE_SHOPPING, "title": "Continue Shopping"},
+            {"id": VIEW_CART, "title": t("view_cart_button", lang)},
+            {"id": CONTINUE_SHOPPING, "title": t("continue_shopping_button", lang)},
         ],
     )
 
 
 async def _handle_cart(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     cart = context.get("cart", {})
     if reply["type"] == "interactive_reply":
         rid = reply["id"]
         if rid == CONTINUE_SHOPPING:
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
-            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0))
+            await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
             return
         if rid == CHECKOUT:
-            await _checkout(wa, sessions, phone, tenant_id, cart)
+            await _checkout(wa, sessions, phone, tenant_id, cart, lang)
             return
 
     sessions.set(tenant_id, phone, STATE_CART, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
-    await _send_cart(wa, phone, tenant_id, cart)
+    await wa.send_text(phone, t("please_choose", lang))
+    await _send_cart(wa, phone, tenant_id, cart, lang)
 
 
-async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict) -> None:
+async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict, lang: str) -> None:
     """Creates a real orders row (ORDER_STATUS_PENDING_PAYMENT) + order_items
     from the cart, decrementing stock atomically, then generates a real
     Razorpay payment link (payments.py) for the order total and sends it as
@@ -656,28 +736,31 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
     racing for the same product is a separate problem this doesn't solve --
     that's what db.checkout_cart()'s atomic stock decrement is for."""
     if not cart:
-        sessions.reset(tenant_id, phone)
-        await wa.send_text(phone, "Your cart is empty. Send any message to start shopping again.")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await wa.send_text(phone, t("cart_empty_checkout", lang))
         return
 
-    sessions.reset(tenant_id, phone)
-    await _complete_checkout_from_cart(wa, tenant_id, phone, cart)
+    sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+    await _complete_checkout_from_cart(wa, tenant_id, phone, cart, lang)
 
 
-async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone: str, cart: dict) -> None:
+async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone: str, cart: dict, lang: str) -> None:
     """The shared tail of both checkout paths: the tap-driven flow above
     (_checkout, after its own empty-cart guard + session reset) and
     handle_native_order below (Meta's native catalog cart, which has no
     session to reset in the first place). Creates the order via
     db.checkout_cart, generates a Razorpay payment link, and sends the
-    confirmation -- identical behavior regardless of which UI built the cart."""
-    order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart)
+    confirmation -- identical behavior regardless of which UI built the cart.
+
+    lang is snapshotted onto the order row (db.checkout_cart's language
+    param) so later payment-webhook confirmations can use it even after the
+    conversation session itself has long since expired -- see
+    handle_payment_success/handle_payment_failure below and schema.sql's
+    orders.language column comment."""
+    order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart, language=lang)
 
     if order is None:
-        await wa.send_text(
-            phone,
-            "Sorry, the items in your cart are no longer available. Please start shopping again.",
-        )
+        await wa.send_text(phone, t("cart_items_unavailable", lang))
         return
 
     items = db.get_order_items(tenant_id, order.id)
@@ -686,18 +769,21 @@ async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone
         f"{_fmt_money(item.unit_price_at_order_time * item.quantity)}"
         for item in items
     )
-    message = f"Order #{order.id} placed!\n\n{lines}\n\nTotal: {_fmt_money(order.total)}"
+    message = (
+        f"{t('order_placed_confirmation', lang, id=order.id)}\n\n{lines}\n\n"
+        f"{t('order_total_label', lang, amount=_fmt_money(order.total))}"
+    )
 
     if unavailable_ids:
         dropped_names = [_product_name(tenant_id, int(pid)) for pid in unavailable_ids]
-        verb = "was" if len(dropped_names) == 1 else "were"
-        message += f"\n\nNote: {', '.join(dropped_names)} went out of stock and {verb} removed from your order."
+        verb = "was" if len(dropped_names) == 1 else "were"  # only referenced by the English template
+        message += "\n\n" + t("items_removed_note", lang, names=", ".join(dropped_names), verb=verb)
 
     tenant = db.get_tenant(tenant_id)
     try:
         payment_url, payment_link_id = payments.create_payment_link(tenant, order)
     except payments.PaymentGatewayNotConfigured:
-        message += "\n\nPayment integration coming next — we'll follow up with a payment link shortly."
+        message += "\n\n" + t("payment_coming_next", lang)
     except Exception:
         # A real Razorpay API failure (network issue, bad credentials, etc.)
         # -- the order still exists and is still payable once the operator
@@ -705,10 +791,10 @@ async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone
         # handler, same "never let a downstream failure break message
         # acknowledgment" rule as core/whatsapp.py's send methods.
         logger.exception("Razorpay payment link creation failed for tenant=%s order=%s", tenant_id, order.id)
-        message += "\n\nWe couldn't generate a payment link right now — we'll follow up shortly."
+        message += "\n\n" + t("payment_link_failed", lang)
     else:
         db.update_order_payment_link(tenant_id, order.id, payment_url, payment_link_id)
-        message += f"\n\nPay here to confirm your order: {payment_url}"
+        message += "\n\n" + t("pay_here", lang, url=payment_url)
 
     await wa.send_text(phone, message)
 
@@ -726,7 +812,16 @@ async def handle_native_order(wa: WhatsAppClient, tenant: db.Tenant, phone: str,
     "drop the bad item, don't fail the whole order" spirit as
     db.checkout_cart's own unavailable_product_ids handling), then reuses
     the exact same order-creation + payment-link logic the tap-driven flow
-    uses via _complete_checkout_from_cart."""
+    uses via _complete_checkout_from_cart.
+
+    Language: there is no session for a native-catalog customer to have
+    chosen one in -- browsing and cart-building happen entirely inside
+    WhatsApp's own UI, with no bot conversation turn until this final
+    "Send order" webhook. DEFAULT_LANG (English) is used for this path's
+    messages; there's no conversational touchpoint where a native-catalog
+    customer could ever be asked, so this is a real, structural limitation
+    of Meta's native flow, not something core/strings.py's lookup can work
+    around."""
     cart: dict[str, int] = {}
     for item in product_items:
         retailer_id = item.get("product_retailer_id")
@@ -752,12 +847,10 @@ async def handle_native_order(wa: WhatsAppClient, tenant: db.Tenant, phone: str,
         cart[key] = cart.get(key, 0) + qty
 
     if not cart:
-        await wa.send_text(
-            phone, "Sorry, we couldn't process your order — none of the items are available right now.",
-        )
+        await wa.send_text(phone, t("native_order_unavailable", DEFAULT_LANG))
         return
 
-    await _complete_checkout_from_cart(wa, tenant.id, phone, cart)
+    await _complete_checkout_from_cart(wa, tenant.id, phone, cart, DEFAULT_LANG)
 
 
 # --- Payment webhook handlers (SPEC.md Section 3.3, Phase 3) ---
@@ -767,7 +860,10 @@ async def handle_native_order(wa: WhatsAppClient, tenant: db.Tenant, phone: str,
 # functions assume that's already happened and just act on a trusted event.
 # No session/state-machine involvement here (unlike everything above) --
 # payment webhooks aren't part of a customer's live conversation turn, they
-# can arrive minutes or hours after the customer last messaged.
+# can arrive minutes or hours after the customer last messaged, often well
+# after their session has expired -- so language comes from order.language
+# (snapshotted at checkout, see _complete_checkout_from_cart), never from a
+# session lookup.
 
 async def handle_payment_success(
     wa: WhatsAppClient, tenant_id: int, order_id: int, payment_gateway_reference: str | None,
@@ -795,7 +891,7 @@ async def handle_payment_success(
         logger.info("Duplicate payment-success webhook for already-paid order %s, ignoring", order_id)
         return
 
-    await wa.send_text(order.customer_phone, f"Payment received! Your order #{order.id} is confirmed.")
+    await wa.send_text(order.customer_phone, t("payment_received", order.language, id=order.id))
 
 
 async def handle_payment_failure(wa: WhatsAppClient, tenant: db.Tenant, order_id: int, link_expired: bool) -> None:
@@ -819,18 +915,13 @@ async def handle_payment_failure(wa: WhatsAppClient, tenant: db.Tenant, order_id
         logger.info("Duplicate/stale payment-failure webhook for order %s (already failed or paid), ignoring", order_id)
         return
 
+    lang = order.language
+
     if not link_expired:
         if order.payment_link_url:
-            await wa.send_text(
-                order.customer_phone,
-                f"Your payment for order #{order.id} didn't go through. "
-                f"You can try again here: {order.payment_link_url}",
-            )
+            await wa.send_text(order.customer_phone, t("payment_failed_retry", lang, id=order.id, url=order.payment_link_url))
         else:
-            await wa.send_text(
-                order.customer_phone,
-                f"Your payment for order #{order.id} didn't go through. Please contact us to complete your order.",
-            )
+            await wa.send_text(order.customer_phone, t("payment_failed_no_link", lang, id=order.id))
         return
 
     try:
@@ -839,57 +930,50 @@ async def handle_payment_failure(wa: WhatsAppClient, tenant: db.Tenant, order_id
         # Shouldn't normally happen (a payment link already existed for this
         # order, so the tenant was configured at checkout time) -- credentials
         # could have been cleared since. Fail gracefully either way.
-        await wa.send_text(
-            order.customer_phone,
-            f"There was a problem with payment for order #{order.id}. Please contact us to complete your order.",
-        )
+        await wa.send_text(order.customer_phone, t("payment_problem_no_gateway", lang, id=order.id))
         return
     except Exception:
         logger.exception("Razorpay retry-link creation failed for tenant=%s order=%s", tenant.id, order_id)
-        await wa.send_text(
-            order.customer_phone,
-            f"There was a problem generating a new payment link for order #{order.id}. Please contact us to complete your order.",
-        )
+        await wa.send_text(order.customer_phone, t("payment_link_retry_failed", lang, id=order.id))
         return
 
     db.update_order_payment_link(tenant.id, order_id, new_url, new_link_id)
-    await wa.send_text(
-        order.customer_phone,
-        f"Your payment link for order #{order.id} expired. Here's a new one: {new_url}",
-    )
+    await wa.send_text(order.customer_phone, t("payment_link_expired_new", lang, id=order.id, url=new_url))
 
 
 async def _handle_order_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     if reply["type"] == "interactive_reply":
         order_id = _parse_order_row_id(reply["id"])
         if order_id is not None:
             order = db.get_order(tenant_id, order_id)
             if order and order.customer_phone == phone:
-                sessions.set(tenant_id, phone, STATE_ORDER_DETAIL, {"order_id": order.id})
-                await _send_order_detail(wa, phone, tenant_id, order)
+                sessions.set(tenant_id, phone, STATE_ORDER_DETAIL, {**context, "order_id": order.id})
+                await _send_order_detail(wa, phone, tenant_id, order, lang)
                 return
 
     sessions.set(tenant_id, phone, STATE_ORDER_LIST, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
-    await _send_orders_list(wa, phone, tenant_id, phone)
+    await wa.send_text(phone, t("please_choose", lang))
+    await _send_orders_list(wa, phone, tenant_id, phone, lang)
 
 
 async def _handle_order_detail(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    lang = context.get("language", DEFAULT_LANG)
     if reply["type"] == "interactive_reply" and reply["id"] == MAIN_MENU_BTN:
-        sessions.reset(tenant_id, phone)
-        await _send_main_menu(wa, phone, "the store")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await _send_main_menu(wa, phone, "the store", lang)
         return
 
     order_id = context.get("order_id")
     order = db.get_order(tenant_id, order_id) if order_id is not None else None
     if not order:
-        sessions.reset(tenant_id, phone)
-        await wa.send_text(phone, "Something went wrong finding that order. Please start over.")
+        sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
+        await wa.send_text(phone, t("order_not_found", lang))
         return
 
     sessions.set(tenant_id, phone, STATE_ORDER_DETAIL, context)
-    await wa.send_text(phone, _PLEASE_CHOOSE)
-    await _send_order_detail(wa, phone, tenant_id, order)
+    await wa.send_text(phone, t("please_choose", lang))
+    await _send_order_detail(wa, phone, tenant_id, order, lang)
 
 
 _HANDLERS = {
@@ -911,42 +995,38 @@ async def handle_incoming(
     tenant_name: str = "the store",
 ) -> None:
     """
-    Entry point: check for a global reset keyword first (works from *any*
-    state, unlike the old booking_flow.py's IDLE-only fallback), then check
-    for a main-menu button tap (same "works from any state" reasoning --
-    see _MAIN_MENU_IDS below), then look up the customer's current session
-    (sessions.get already resets stale/timed-out sessions to IDLE) and
-    dispatch to the matching state handler.
+    Entry point: look up the customer's current session (sessions.get
+    already resets stale/timed-out sessions to IDLE), then dispatch.
+
+    A global reset keyword (works from *any* state, unlike the old
+    booking_flow.py's IDLE-only fallback) and a main-menu button tap (same
+    "works from any state" reasoning -- WhatsApp keeps old interactive
+    messages tappable indefinitely, see _MAIN_MENU_IDS) both route straight
+    to _handle_idle regardless of the session's current state -- which is
+    also exactly where the "unrecognized state" fallback below routes.
+    _handle_idle itself is what decides whether that means "show the main
+    menu" (a language was already chosen this conversation) or "ask for a
+    language first" (it wasn't) -- see that function's docstring. Routing
+    all three cases through the same function is what makes language
+    preservation-across-resets automatic rather than three separate copies
+    of the same logic.
     """
-    if reply["type"] == "text" and reply.get("text", "").strip().lower() in RESET_KEYWORDS:
-        sessions.reset(tenant_id, phone)
-        await _send_main_menu(wa, phone, tenant_name)
-        return
-
-    if reply["type"] == "interactive_reply" and reply.get("id") in _MAIN_MENU_IDS:
-        # WhatsApp keeps every past interactive message tappable indefinitely
-        # -- a customer mid-flow (viewing a product, sitting in their cart,
-        # browsing past orders) can scroll back and tap a stale main-menu
-        # button from an earlier message. Without this check, that tap would
-        # land in whatever handler the *current* session state maps to,
-        # which doesn't recognize a menu_* id and falls back to
-        # _PLEASE_CHOOSE + re-showing the unrelated in-progress flow --
-        # confusing, and looks like the button is broken (it repeats
-        # identically on a second tap, since the state never changes).
-        # Routing straight to _handle_idle here treats an explicit main-menu
-        # selection as always authoritative, the same "works from any state"
-        # principle RESET_KEYWORDS above already established for free text.
-        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name)
-        return
-
     session = sessions.get(tenant_id, phone)
     state = session["state"]
     context = session["context"]
 
+    if reply["type"] == "text" and reply.get("text", "").strip().lower() in RESET_KEYWORDS:
+        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name, context)
+        return
+
+    if reply["type"] == "interactive_reply" and reply.get("id") in _MAIN_MENU_IDS:
+        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name, context)
+        return
+
     handler = _HANDLERS.get(state)
     if handler is None:
         # IDLE, or any unrecognized/stale state value -> treat as IDLE.
-        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name)
+        await _handle_idle(wa, sessions, phone, tenant_id, reply, tenant_name, context)
         return
 
     await handler(wa, sessions, phone, tenant_id, reply, context)

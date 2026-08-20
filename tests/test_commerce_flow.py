@@ -17,6 +17,7 @@ from core.commerce_flow import (
 from core.history import InMemorySessionStore
 
 PHONE = "919999999999"
+PHONE2 = "919999999998"  # used only by the "--- Language selection ---" tests -- see _default_to_english
 
 
 class FakeWhatsAppClient:
@@ -84,10 +85,27 @@ def sessions():
     return InMemorySessionStore()
 
 
+@pytest.fixture(autouse=True)
+def _default_to_english(sessions, tenant_id):
+    """Every test below except the dedicated "--- Language selection ---"
+    section was written (and every test added since) assuming a session is
+    immediately ready to show the main menu/product list/etc -- pre-seeding
+    English here keeps that true without needing every single test to tap
+    a language button first. The language-selection tests use PHONE2
+    instead of PHONE specifically so this pre-seeded session (keyed by
+    (tenant_id, PHONE)) doesn't mask the real from-scratch behavior they're
+    testing."""
+    sessions.set(tenant_id, PHONE, "IDLE", {"language": "en"})
+
+
 # --- Main menu ---
 
 @pytest.mark.asyncio
 async def test_first_contact_shows_welcome_and_main_menu(wa, sessions, tenant_id):
+    """With English already selected (see _default_to_english), a reset
+    keyword shows the welcome message + main menu directly -- real
+    first-contact-with-no-language-yet behavior is covered separately
+    under "--- Language selection ---" below."""
     await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("hi"), "Test Store")
 
     assert wa.sent[-1][0] == "list"
@@ -172,8 +190,9 @@ async def test_full_shop_flow_browse_add_to_cart_view_cart_checkout_creates_orde
     assert items[0].quantity == 1
     assert items[0].unit_price_at_order_time == Decimal("199.00")
 
-    # Session resets to IDLE (and cart is gone) after checkout.
-    assert sessions.get(tenant_id, PHONE) == {"state": "IDLE", "context": {}}
+    # Session resets to IDLE (and cart is gone) after checkout -- language is
+    # preserved across the reset, not wiped (see _handle_idle's docstring).
+    assert sessions.get(tenant_id, PHONE) == {"state": "IDLE", "context": {"language": "en"}}
 
 
 @pytest.mark.asyncio
@@ -521,7 +540,8 @@ async def test_reset_keyword_works_mid_shopping_flow(wa, sessions, tenant_id):
 
     await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("menu"), "Test Store")
 
-    assert sessions.get(tenant_id, PHONE) == {"state": "IDLE", "context": {}}
+    # Language is preserved across the reset, not wiped (see _handle_idle's docstring).
+    assert sessions.get(tenant_id, PHONE) == {"state": "IDLE", "context": {"language": "en"}}
     assert wa.sent[-1][0] == "list"
     assert "Welcome to Test Store" in wa.sent[-1][1]["body_text"]
 
@@ -807,3 +827,175 @@ async def test_handle_payment_failure_never_downgrades_an_already_paid_order(wa,
 
     assert db.get_order(tenant_id, order.id).status == db.ORDER_STATUS_PAID  # not downgraded
     assert wa.sent == []
+
+
+# --- Language selection ---
+# Uses PHONE2, not PHONE -- _default_to_english's autouse fixture only
+# pre-seeds (tenant_id, PHONE), so these tests see the real from-scratch
+# "no language chosen yet" behavior every other test in this file is
+# deliberately shielded from.
+
+def _lang_tap(lang_id: str):
+    return tap(lang_id)
+
+
+@pytest.mark.asyncio
+async def test_first_contact_shows_language_prompt_not_main_menu(wa, sessions, tenant_id):
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+
+    assert wa.sent[-1][0] == "buttons"
+    body = wa.sent[-1][1]
+    assert "select your language" in body["body_text"] and "भाषा" in body["body_text"]
+    assert {b["id"]: b["title"] for b in body["buttons"]} == {"lang_en": "English", "lang_hi": "हिन्दी"}
+    # No main menu shown yet -- language wasn't chosen.
+    assert not any(kind == "list" for kind, _ in wa.sent)
+
+
+@pytest.mark.asyncio
+async def test_selecting_english_shows_main_menu_in_english(wa, sessions, tenant_id):
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_en"), "Test Store")
+
+    assert wa.sent[-1][0] == "list"
+    body = wa.sent[-1][1]
+    assert "Welcome to Test Store" in body["body_text"]
+    assert {row["title"] for section in body["sections"] for row in section["rows"]} == {
+        "Shop Now", "My Orders", "Track Order", "Offers", "Account", "Talk to Us",
+    }
+    assert sessions.get(tenant_id, PHONE2)["context"]["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_selecting_hindi_shows_main_menu_in_hindi(wa, sessions, tenant_id):
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_hi"), "Test Store")
+
+    assert wa.sent[-1][0] == "list"
+    body = wa.sent[-1][1]
+    assert "नमस्ते!" in body["body_text"] and "Test Store" in body["body_text"]
+    assert {row["title"] for section in body["sections"] for row in section["rows"]} == {
+        "अभी खरीदें", "मेरे ऑर्डर", "ऑर्डर ट्रैक करें", "ऑफ़र", "खाता", "हमसे बात करें",
+    }
+    assert sessions.get(tenant_id, PHONE2)["context"]["language"] == "hi"
+
+
+@pytest.mark.asyncio
+async def test_hindi_reset_keywords_work_and_preserve_hindi(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="10.00")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap(f"product_{widget.id}"))
+    assert sessions.get(tenant_id, PHONE2)["state"] == "PRODUCT_DETAIL"
+
+    for keyword in ("नमस्ते", "मेनू"):
+        await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply(keyword), "Test Store")
+        assert sessions.get(tenant_id, PHONE2) == {"state": "IDLE", "context": {"language": "hi"}}
+        assert wa.sent[-1][0] == "list"
+        assert wa.sent[-1][1]["sections"][0]["title"] == "मुख्य मेनू"  # main menu shown, still in Hindi, not re-prompted
+
+
+@pytest.mark.asyncio
+async def test_full_shop_checkout_flow_in_english(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="199.00")
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_en"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap(f"product_{widget.id}"))
+    assert {b["title"] for b in wa.sent[-1][1]["buttons"]} == {"Add to Cart", "Back to Products"}
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("add_to_cart"))
+    assert "Added Widget to your cart" in wa.sent[-1][1]["body_text"]
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("view_cart"))
+    assert "Your Cart:" in wa.sent[-1][1]["body_text"]
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("checkout"))
+    assert "Order #" in wa.sent[-1][1]["text"] and "placed!" in wa.sent[-1][1]["text"]
+
+    order = db.get_orders_for_phone(tenant_id, PHONE2)[0]
+    assert order.language == "en"
+
+
+@pytest.mark.asyncio
+async def test_full_shop_checkout_flow_in_hindi(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="199.00")
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_hi"), "Test Store")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("menu_shop"))
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap(f"product_{widget.id}"))
+    assert {b["title"] for b in wa.sent[-1][1]["buttons"]} == {"कार्ट में जोड़ें", "उत्पादों पर वापस जाएं"}
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("add_to_cart"))
+    assert "आपके कार्ट में जोड़ दिया गया" in wa.sent[-1][1]["body_text"]
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("view_cart"))
+    assert "आपका कार्ट:" in wa.sent[-1][1]["body_text"]
+
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, tap("checkout"))
+    assert "दर्ज हो गया" in wa.sent[-1][1]["text"]
+
+    order = db.get_orders_for_phone(tenant_id, PHONE2)[0]
+    assert order.language == "hi"
+    items = db.get_order_items(tenant_id, order.id)
+    assert len(items) == 1
+    assert items[0].product_id == widget.id  # the flow actually completed correctly, not just the text
+
+
+@pytest.mark.asyncio
+async def test_language_choice_isolated_across_tenants(wa, sessions, tenant_id, second_tenant_id):
+    """Two different tenants, same customer phone number -- the session
+    store keys by (tenant_id, phone), so one tenant's chosen language must
+    never leak into the other's conversation with that same customer."""
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, text_reply("hi"), "Store A")
+    await handle_incoming(wa, sessions, PHONE2, tenant_id, _lang_tap("lang_hi"), "Store A")
+
+    await handle_incoming(wa, sessions, PHONE2, second_tenant_id, text_reply("hi"), "Store B")
+    assert wa.sent[-1][0] == "buttons"  # tenant B's conversation with the same phone starts fresh -- language prompt, not Hindi main menu
+    await handle_incoming(wa, sessions, PHONE2, second_tenant_id, _lang_tap("lang_en"), "Store B")
+
+    assert sessions.get(tenant_id, PHONE2)["context"]["language"] == "hi"
+    assert sessions.get(second_tenant_id, PHONE2)["context"]["language"] == "en"
+
+
+@pytest.mark.asyncio
+async def test_native_order_messages_use_default_language(wa, tenant_id):
+    """Documents a real, structural limitation (see handle_native_order's
+    docstring): there is no conversational touchpoint for a native-catalog
+    customer to ever choose a language in, so these messages are always
+    English regardless of what a tap-driven customer on the same tenant
+    might have chosen."""
+    tenant = db.get_tenant(tenant_id)
+    await handle_native_order(wa, tenant, PHONE2, [{"product_retailer_id": "nonexistent", "quantity": "1"}])
+    assert wa.sent[-1] == ("text", {
+        "to": PHONE2,
+        "text": "Sorry, we couldn't process your order — none of the items are available right now.",
+    })
+
+
+@pytest.mark.asyncio
+async def test_payment_success_message_uses_order_language_not_a_live_session(wa, tenant_id):
+    """handle_payment_success has no session to read a language from (the
+    conversation may have expired long before payment happens) -- it must
+    use order.language, snapshotted at checkout time."""
+    order = db.create_order(tenant_id, PHONE2, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"), language="hi")
+
+    await handle_payment_success(wa, tenant_id, order.id, "pay_abc123")
+
+    assert wa.sent[-1][0] == "text"
+    assert "भुगतान प्राप्त हुआ" in wa.sent[-1][1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_payment_failure_message_uses_order_language(wa, tenant_id):
+    order = db.create_order(tenant_id, PHONE2, status=db.ORDER_STATUS_PENDING_PAYMENT,
+                             subtotal=Decimal("100.00"), total=Decimal("100.00"), language="hi")
+    tenant = db.get_tenant(tenant_id)
+
+    await handle_payment_failure(wa, tenant, order.id, link_expired=False)
+
+    assert wa.sent[-1][0] == "text"
+    assert "भुगतान सफल नहीं हुआ" in wa.sent[-1][1]["text"]

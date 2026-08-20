@@ -25,6 +25,7 @@ from portal.products import router as portal_products_router
 from portal.settings import router as portal_settings_router
 from core.commerce_flow import handle_incoming, handle_native_order, handle_payment_failure, handle_payment_success
 from core.history import get_history, get_session_store
+from core.strings import DEFAULT_LANG, t
 from core.whatsapp import WhatsAppClient, extract_phone_number_id, parse_incoming_message, validate_webhook_signature
 from db.init_db import init_db
 from reminders.scheduler import send_abandoned_cart_nudges
@@ -231,7 +232,8 @@ async def receive_message(request: Request):
         if reply["type"] == "audio":
             # No transcription pipeline (no AI/LLM in this build) — bypass the state
             # machine entirely and tell the customer to use text instead.
-            await wa.send_text(phone, "I couldn't process your audio. Could you send it as text instead?")
+            lang = SESSIONS.get(tenant.id, phone)["context"].get("language", DEFAULT_LANG)
+            await wa.send_text(phone, t("audio_not_supported", lang))
             return Response(status_code=200)
 
     except (KeyError, IndexError, TypeError, ValueError):
