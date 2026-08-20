@@ -42,11 +42,13 @@ async def orders_list(request: Request, status: str = ""):
         return RedirectResponse(url="/portal/login", status_code=303)
 
     orders = db.list_orders(tenant.id, status=status or None)
+    customer_names = db.get_customer_names(tenant.id, [o.customer_phone for o in orders])
 
     return templates.TemplateResponse(request, "portal/orders_list.html", {
         "tenant": tenant,
         "active_nav": "orders",
         "orders": orders,
+        "customer_names": customer_names,
         "status_filters": _STATUS_FILTERS,
         "current_status": status,
     })
@@ -73,11 +75,14 @@ async def order_detail(request: Request, order_id: int):
             "line_total": item.unit_price_at_order_time * item.quantity,
         })
 
+    customer = db.get_customer(tenant.id, order.customer_phone)
+
     return templates.TemplateResponse(request, "portal/order_detail.html", {
         "tenant": tenant,
         "active_nav": "orders",
         "order": order,
         "line_items": line_items,
+        "customer_name": customer.name if customer else None,
         "can_fulfill": order.status == db.ORDER_STATUS_PAID,
     })
 

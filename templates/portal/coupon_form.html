@@ -1,0 +1,35 @@
+{% extends "portal/_base.html" %}
+{% block title %}Add coupon — ShopTransact{% endblock %}
+{% block portal_content %}
+
+<p><a href="/portal/coupons" class="btn-link">&larr; Back to coupons</a></p>
+<h1>Add coupon</h1>
+
+{% if errors %}
+<div class="error-banner"><strong>Please fix the following:</strong>
+  <ul>{% for e in errors %}<li>{{ e }}</li>{% endfor %}</ul>
+</div>
+{% endif %}
+
+<div class="card">
+  <form method="post" action="/portal/coupons/new">
+    <label>Code</label>
+    <input type="text" name="code" value="{{ v.code }}" required>
+
+    <label>Discount type</label>
+    <select name="discount_type">
+      <option value="percentage" {{ "selected" if v.discount_type == "percentage" else "" }}>Percentage off</option>
+      <option value="flat" {{ "selected" if v.discount_type == "flat" else "" }}>Flat amount off (INR)</option>
+    </select>
+
+    <label>Discount value</label>
+    <input type="text" name="discount_value" value="{{ v.discount_value }}" required>
+
+    <label>Expires (optional)</label>
+    <input type="date" name="expires_at" value="{{ v.expires_at }}">
+
+    <button type="submit" class="btn btn-primary" style="margin-top: var(--space-5);">Add coupon</button>
+  </form>
+</div>
+
+{% endblock %}

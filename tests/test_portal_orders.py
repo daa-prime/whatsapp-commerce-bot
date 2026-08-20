@@ -161,6 +161,49 @@ def test_fulfill_already_fulfilled_does_not_resend_notification(tenant_id, httpx
     assert len(httpx_mock.get_requests()) == 1  # only the first click actually transitioned the order
 
 
+def test_orders_list_shows_customer_name_when_on_file(tenant_id):
+    order = db.create_order(tenant_id, "9998887777", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+    db.set_customer_name(tenant_id, "9998887777", "Ravi Kumar")
+
+    client = _login(tenant_id)
+    resp = client.get("/portal/orders")
+
+    assert "Ravi Kumar" in resp.text
+    assert f"#{order.id}" in resp.text
+
+
+def test_orders_list_falls_back_to_phone_when_no_name_on_file(tenant_id):
+    db.create_order(tenant_id, "9998887777", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+
+    client = _login(tenant_id)
+    resp = client.get("/portal/orders")
+
+    assert "9998887777" in resp.text
+
+
+def test_order_detail_shows_customer_name_when_on_file(tenant_id):
+    order = db.create_order(tenant_id, "9998887777", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+    db.set_customer_name(tenant_id, "9998887777", "Ravi Kumar")
+
+    client = _login(tenant_id)
+    resp = client.get(f"/portal/orders/{order.id}")
+
+    assert "Ravi Kumar" in resp.text
+    assert "9998887777" in resp.text  # phone still shown too
+
+
+def test_order_detail_shows_applied_coupon(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    order, _ = db.checkout_cart(tenant_id, "9998887777", {str(product.id): 1}, coupon_code="SAVE10")
+
+    client = _login(tenant_id)
+    resp = client.get(f"/portal/orders/{order.id}")
+
+    assert "SAVE10" in resp.text
+    assert "10.00" in resp.text  # discount amount
+
+
 def test_cross_tenant_isolation(tenant_id, second_tenant_id):
     order_a = db.create_order(tenant_id, "111", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
     order_b = db.create_order(second_tenant_id, "222", status=db.ORDER_STATUS_PAID, subtotal=Decimal("75"), total=Decimal("75"))

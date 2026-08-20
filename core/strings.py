@@ -56,10 +56,6 @@ _STRINGS: dict[str, dict[str, str]] = {
         LANG_EN: "Talk to Us",
         LANG_HI: "हमसे बात करें",
     },
-    "offers_coming_soon": {
-        LANG_EN: "Offers are coming soon!",
-        LANG_HI: "ऑफ़र जल्द ही आ रहे हैं!",
-    },
     "account_coming_soon": {
         LANG_EN: "Account management is coming soon!",
         LANG_HI: "खाता प्रबंधन जल्द ही आ रहा है!",
@@ -255,6 +251,50 @@ _STRINGS: dict[str, dict[str, str]] = {
     "order_fulfilled": {
         LANG_EN: "Good news! Your order #{id} has been fulfilled and is on its way.",
         LANG_HI: "अच्छी खबर! आपका ऑर्डर #{id} पूरा हो गया है और जल्द ही आप तक पहुंच जाएगा।",
+    },
+    "ask_customer_name": {
+        LANG_EN: "What name should we use for this order?",
+        LANG_HI: "इस ऑर्डर के लिए हम किस नाम का उपयोग करें?",
+    },
+    "apply_coupon_button": {
+        LANG_EN: "Apply Coupon",
+        LANG_HI: "कूपन लगाएं",
+    },
+    "ask_coupon_code": {
+        LANG_EN: "Please enter your coupon code.",
+        LANG_HI: "कृपया अपना कूपन कोड दर्ज करें।",
+    },
+    "coupon_error_not_found": {
+        LANG_EN: "\"{code}\" isn't a valid coupon code.",
+        LANG_HI: "\"{code}\" एक मान्य कूपन कोड नहीं है।",
+    },
+    "coupon_error_inactive": {
+        LANG_EN: "\"{code}\" is no longer active.",
+        LANG_HI: "\"{code}\" अब सक्रिय नहीं है।",
+    },
+    "coupon_error_expired": {
+        LANG_EN: "\"{code}\" has expired.",
+        LANG_HI: "\"{code}\" की अवधि समाप्त हो गई है।",
+    },
+    "coupon_discount_label": {
+        LANG_EN: "Discount ({code}): -{amount}",
+        LANG_HI: "छूट ({code}): -{amount}",
+    },
+    "offers_list_header": {
+        LANG_EN: "Here are our current offers — apply one at checkout:",
+        LANG_HI: "यहां हमारे मौजूदा ऑफ़र हैं — चेकआउट पर लागू करें:",
+    },
+    "offers_percentage_line": {
+        LANG_EN: "{code} — {value}% off",
+        LANG_HI: "{code} — {value}% छूट",
+    },
+    "offers_flat_line": {
+        LANG_EN: "{code} — {value} off",
+        LANG_HI: "{code} — {value} छूट",
+    },
+    "no_offers_available": {
+        LANG_EN: "We don't have any active offers right now — check back soon!",
+        LANG_HI: "फ़िलहाल हमारे पास कोई सक्रिय ऑफ़र नहीं है — जल्द ही फिर देखें!",
     },
 }
 

@@ -94,8 +94,16 @@ def _default_to_english(sessions, tenant_id):
     a language button first. The language-selection tests use PHONE2
     instead of PHONE specifically so this pre-seeded session (keyed by
     (tenant_id, PHONE)) doesn't mask the real from-scratch behavior they're
-    testing."""
+    testing.
+
+    Also pre-seeds a name on file for PHONE/PHONE2 -- most existing tests
+    (written before name collection existed) assume tapping Checkout goes
+    straight to an order confirmation, i.e. the "returning customer" path.
+    The dedicated "--- Name collection ---" section below uses its own
+    fresh, never-seeded phone number to exercise the first-time prompt."""
     sessions.set(tenant_id, PHONE, "IDLE", {"language": "en"})
+    db.set_customer_name(tenant_id, PHONE, "Test Customer")
+    db.set_customer_name(tenant_id, PHONE2, "Test Customer 2")
 
 
 # --- Main menu ---
@@ -118,13 +126,31 @@ async def test_first_contact_shows_welcome_and_main_menu(wa, sessions, tenant_id
 
 
 @pytest.mark.asyncio
-async def test_offers_and_account_are_coming_soon_placeholders(wa, sessions, tenant_id):
-    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_offers"))
-    assert "coming soon" in wa.sent[-1][1]["text"].lower()
-
-    wa.sent.clear()
+async def test_account_is_a_coming_soon_placeholder(wa, sessions, tenant_id):
     await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_account"))
     assert "coming soon" in wa.sent[-1][1]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_offers_with_no_active_coupons_says_so(wa, sessions, tenant_id):
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_offers"))
+    assert "no active offers" not in wa.sent[-1][1]["text"].lower()  # sanity: real copy, not a stray placeholder
+    assert "offer" in wa.sent[-1][1]["text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_offers_lists_active_coupons(wa, sessions, tenant_id):
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    db.create_coupon(tenant_id, "FLAT50", db.COUPON_TYPE_FLAT, Decimal("50"))
+    inactive = db.create_coupon(tenant_id, "OLD5", db.COUPON_TYPE_FLAT, Decimal("5"))
+    db.set_coupon_active(tenant_id, inactive.id, False)
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("menu_offers"))
+
+    text = wa.sent[-1][1]["text"]
+    assert "SAVE10" in text
+    assert "FLAT50" in text
+    assert "OLD5" not in text  # inactive coupons aren't advertised
 
 
 @pytest.mark.asyncio
@@ -167,7 +193,7 @@ async def test_full_shop_flow_browse_add_to_cart_view_cart_checkout_creates_orde
     cart_view = wa.sent[-1][1]
     assert "Widget" in cart_view["body_text"]
     assert "Subtotal: ₹199" in cart_view["body_text"]
-    assert {b["id"] for b in cart_view["buttons"]} == {"checkout", "continue_shopping"}
+    assert {b["id"] for b in cart_view["buttons"]} == {"checkout", "apply_coupon", "continue_shopping"}
 
     # Checkout -> real order + order_items rows, pending_payment, payment stub message
     assert db.get_orders_for_phone(tenant_id, PHONE) == []
@@ -999,3 +1025,199 @@ async def test_payment_failure_message_uses_order_language(wa, tenant_id):
 
     assert wa.sent[-1][0] == "text"
     assert "भुगतान सफल नहीं हुआ" in wa.sent[-1][1]["text"]
+
+
+# --- Name collection (CareConnect's patient-name-collection pattern) ---
+
+NAME_PHONE = "919999999996"  # deliberately never pre-seeded with a customer name -- see _default_to_english
+
+
+def _to_cart(wa_client, sessions, tenant_id, phone, product):
+    return [
+        handle_incoming(wa_client, sessions, phone, tenant_id, tap("menu_shop")),
+        handle_incoming(wa_client, sessions, phone, tenant_id, tap(f"product_{product.id}")),
+        handle_incoming(wa_client, sessions, phone, tenant_id, tap("add_to_cart")),
+        handle_incoming(wa_client, sessions, phone, tenant_id, tap("view_cart")),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_new_customer_is_prompted_for_name_at_checkout(wa, sessions, tenant_id):
+    sessions.set(tenant_id, NAME_PHONE, "IDLE", {"language": "en"})
+    widget = _make_product(tenant_id, name="Widget", price="50.00")
+    for step in _to_cart(wa, sessions, tenant_id, NAME_PHONE, widget):
+        await step
+    assert db.get_customer(tenant_id, NAME_PHONE) is None
+
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, tap("checkout"))
+
+    assert wa.sent[-1] == ("text", {"to": NAME_PHONE, "text": "What name should we use for this order?"})
+    assert sessions.get(tenant_id, NAME_PHONE)["state"] == "COLLECT_NAME"
+    assert db.get_orders_for_phone(tenant_id, NAME_PHONE) == []  # checkout hasn't completed yet
+
+
+@pytest.mark.asyncio
+async def test_giving_name_completes_checkout_and_saves_it(wa, sessions, tenant_id):
+    sessions.set(tenant_id, NAME_PHONE, "IDLE", {"language": "en"})
+    widget = _make_product(tenant_id, name="Widget", price="50.00")
+    for step in _to_cart(wa, sessions, tenant_id, NAME_PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, tap("checkout"))
+
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, text_reply("Ravi Kumar"))
+
+    assert db.get_customer(tenant_id, NAME_PHONE).name == "Ravi Kumar"
+    assert "Order #" in wa.sent[-1][1]["text"]
+    assert len(db.get_orders_for_phone(tenant_id, NAME_PHONE)) == 1
+
+
+@pytest.mark.asyncio
+async def test_returning_customer_skips_name_prompt(wa, sessions, tenant_id):
+    sessions.set(tenant_id, NAME_PHONE, "IDLE", {"language": "en"})
+    db.set_customer_name(tenant_id, NAME_PHONE, "Ravi Kumar")
+    widget = _make_product(tenant_id, name="Widget", price="50.00")
+    for step in _to_cart(wa, sessions, tenant_id, NAME_PHONE, widget):
+        await step
+
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, tap("checkout"))
+
+    assert "Order #" in wa.sent[-1][1]["text"]  # straight to confirmation, no name prompt
+    assert sessions.get(tenant_id, NAME_PHONE)["state"] == "IDLE"
+
+
+@pytest.mark.asyncio
+async def test_name_captured_for_one_tenant_does_not_leak_to_another(wa, sessions, tenant_id, second_tenant_id):
+    sessions.set(tenant_id, NAME_PHONE, "IDLE", {"language": "en"})
+    sessions.set(second_tenant_id, NAME_PHONE, "IDLE", {"language": "en"})
+    widget_a = _make_product(tenant_id, name="Widget A", price="50.00")
+    widget_b = _make_product(second_tenant_id, name="Widget B", price="50.00")
+
+    for step in _to_cart(wa, sessions, tenant_id, NAME_PHONE, widget_a):
+        await step
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, tap("checkout"))
+    await handle_incoming(wa, sessions, NAME_PHONE, tenant_id, text_reply("Ravi Kumar"))
+    assert db.get_customer(tenant_id, NAME_PHONE).name == "Ravi Kumar"
+
+    # Same phone number, a different tenant -- still a stranger there.
+    assert db.get_customer(second_tenant_id, NAME_PHONE) is None
+    for step in _to_cart(wa, sessions, second_tenant_id, NAME_PHONE, widget_b):
+        await step
+    await handle_incoming(wa, sessions, NAME_PHONE, second_tenant_id, tap("checkout"))
+
+    assert "What name should we use" in wa.sent[-1][1]["text"]
+
+
+# --- Coupons applied at checkout ---
+
+@pytest.mark.asyncio
+async def test_apply_valid_percentage_coupon_shows_discount_in_cart(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="200.00")
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+    assert "coupon code" in wa.sent[-1][1]["text"].lower()
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("save10"))  # lowercase -- matched case-insensitively
+
+    cart_view = wa.sent[-1][1]
+    assert "Discount (SAVE10): -₹20" in cart_view["body_text"]
+    assert "Total: ₹180" in cart_view["body_text"]
+    assert sessions.get(tenant_id, PHONE)["context"]["coupon_code"] == "SAVE10"
+
+
+@pytest.mark.asyncio
+async def test_checkout_with_applied_percentage_coupon(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="200.00")
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("SAVE10"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    order = db.get_orders_for_phone(tenant_id, PHONE)[0]
+    assert order.coupon_code == "SAVE10"
+    assert order.discount_amount == Decimal("20.00")
+    assert order.total == Decimal("180.00")
+    confirm_text = wa.sent[-1][1]["text"]
+    assert "Discount (SAVE10): -₹20" in confirm_text
+    assert "Total: ₹180" in confirm_text
+
+
+@pytest.mark.asyncio
+async def test_checkout_with_applied_flat_coupon(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00")
+    db.create_coupon(tenant_id, "FLAT30", db.COUPON_TYPE_FLAT, Decimal("30"))
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("FLAT30"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("checkout"))
+
+    order = db.get_orders_for_phone(tenant_id, PHONE)[0]
+    assert order.discount_amount == Decimal("30.00")
+    assert order.total == Decimal("70.00")
+
+
+@pytest.mark.asyncio
+async def test_invalid_coupon_code_rejected_with_clear_message(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00")
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("BOGUS"))
+
+    messages = [m[1]["text"] for m in wa.sent if m[0] == "text"]
+    assert any("isn't a valid coupon code" in m for m in messages)
+    assert sessions.get(tenant_id, PHONE)["context"].get("coupon_code") is None
+
+
+@pytest.mark.asyncio
+async def test_expired_coupon_code_rejected(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00")
+    db.create_coupon(tenant_id, "OLD5", db.COUPON_TYPE_FLAT, Decimal("5"), expires_at="2000-01-01")
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("OLD5"))
+
+    messages = [m[1]["text"] for m in wa.sent if m[0] == "text"]
+    assert any("expired" in m.lower() for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_inactive_coupon_code_rejected(wa, sessions, tenant_id):
+    widget = _make_product(tenant_id, name="Widget", price="100.00")
+    coupon = db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    db.set_coupon_active(tenant_id, coupon.id, False)
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("SAVE10"))
+
+    messages = [m[1]["text"] for m in wa.sent if m[0] == "text"]
+    assert any("no longer active" in m for m in messages)
+
+
+@pytest.mark.asyncio
+async def test_coupon_from_another_tenant_is_rejected(wa, sessions, tenant_id, second_tenant_id):
+    """A coupon created for tenant B must never work on tenant A's cart --
+    _handle_apply_coupon's lookup (db.get_coupon_by_code) is itself
+    tenant-scoped, so tenant A's checkout can't even find it."""
+    widget = _make_product(tenant_id, name="Widget", price="100.00")
+    db.create_coupon(second_tenant_id, "OTHERTENANT", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    for step in _to_cart(wa, sessions, tenant_id, PHONE, widget):
+        await step
+    await handle_incoming(wa, sessions, PHONE, tenant_id, tap("apply_coupon"))
+
+    await handle_incoming(wa, sessions, PHONE, tenant_id, text_reply("OTHERTENANT"))
+
+    messages = [m[1]["text"] for m in wa.sent if m[0] == "text"]
+    assert any("isn't a valid coupon code" in m for m in messages)

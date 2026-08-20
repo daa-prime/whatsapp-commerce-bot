@@ -179,6 +179,56 @@ ALTER TABLE orders ADD COLUMN IF NOT EXISTS payment_method TEXT;
 -- preference from, but the order row itself persists indefinitely.
 ALTER TABLE orders ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'en';
 
+-- One row per (tenant, phone) that has ever given a name at checkout --
+-- mirrors CareConnect's patient-name-collection pattern: a lightweight
+-- customer record keyed by phone+tenant, not a full customer-profile table
+-- (no address/email/preferences yet -- add columns here if/when a real need
+-- shows up, not speculatively). A dedicated table rather than a name column
+-- on orders because "is there already a name on file" has to be checked
+-- *before* an order exists yet (core/commerce_flow.py prompts for it at
+-- checkout, before db.checkout_cart creates the order row) and a name, once
+-- given, should be remembered across every future order, not re-asked or
+-- re-stored per order.
+CREATE TABLE IF NOT EXISTS customers (
+    tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+    phone TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (now()::text),
+    updated_at TEXT NOT NULL DEFAULT (now()::text),
+    PRIMARY KEY (tenant_id, phone)
+);
+
+-- Which coupon (if any) was applied to this order -- kept as the raw code
+-- text, not a coupons.id foreign key, so the order's own record of what
+-- discount it got survives even if the coupon is later deleted (this schema
+-- has no coupon-delete function, only deactivate, but the order shouldn't
+-- depend on that either way). NULL for the (overwhelming majority of)
+-- orders placed without a coupon.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS coupon_code TEXT;
+-- The actual amount knocked off subtotal by that coupon, snapshotted at
+-- checkout time -- same "snapshot at creation, don't recompute later"
+-- reasoning as unit_price_at_order_time/orders.language, so a coupon being
+-- edited/deactivated afterward never retroactively changes what an existing
+-- order's total is understood to have been.
+ALTER TABLE orders ADD COLUMN IF NOT EXISTS discount_amount NUMERIC(12, 2);
+
+-- Merchant-created discount codes (SPEC.md "Offers" menu item, previously a
+-- placeholder). discount_type/discount_value together express either "15%
+-- off" (percentage, discount_value = 15) or "flat 100 off" (flat,
+-- discount_value = 100 in the tenant's currency) -- two columns rather than
+-- one, so validation/display code never has to sniff a value's meaning.
+CREATE TABLE IF NOT EXISTS coupons (
+    id SERIAL PRIMARY KEY,
+    tenant_id INTEGER NOT NULL REFERENCES tenants(id),
+    code TEXT NOT NULL,
+    discount_type TEXT NOT NULL CHECK (discount_type IN ('percentage', 'flat')),
+    discount_value NUMERIC(12, 2) NOT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (now()::text),
+    UNIQUE(tenant_id, code)
+);
+
 -- tenant_id is included directly here (not just reachable via order_id ->
 -- orders.tenant_id) for the same reason the hospital schema's
 -- appointment_reminders carried hospital_id alongside appointment_id: every

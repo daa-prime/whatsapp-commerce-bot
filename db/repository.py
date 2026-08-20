@@ -15,6 +15,7 @@ and payment integration both depend on this data model existing first.
 """
 import json as json_lib
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 
 from db.connection import get_connection
@@ -395,6 +396,8 @@ class Order:
     nudge_sent_at: str | None
     payment_method: str | None  # e.g. "upi"/"card"/"netbanking"/"wallet" (payments.py); NULL until paid
     language: str  # core/strings.py's LANG_EN/LANG_HI, snapshotted at checkout -- see schema.sql's column comment
+    coupon_code: str | None  # the coupon actually applied at checkout, if any -- see schema.sql's column comment
+    discount_amount: Decimal | None  # amount knocked off subtotal by coupon_code, snapshotted at checkout
 
 
 def _row_to_order(row) -> Order:
@@ -412,6 +415,8 @@ def _row_to_order(row) -> Order:
         nudge_sent_at=row["nudge_sent_at"],
         payment_method=row["payment_method"],
         language=row["language"],
+        coupon_code=row["coupon_code"],
+        discount_amount=row["discount_amount"],
     )
 
 
@@ -576,6 +581,7 @@ def checkout_cart(
     cart: dict[str, int],
     conn=None,
     language: str = "en",
+    coupon_code: str | None = None,
 ) -> tuple[Order | None, list[str]]:
     """Atomically checks stock, decrements it, and creates the order +
     order_items for a customer's cart in a single DB transaction (core/
@@ -627,10 +633,36 @@ def checkout_cart(
             return None, unavailable
 
         subtotal = sum((price * qty for _, qty, price in line_items), Decimal("0"))
+
+        # Coupon is validated (and its discount computed) against this
+        # transaction's own freshly-computed subtotal, inside the same
+        # transaction as the stock decrement -- not against whatever
+        # subtotal the cart-view preview showed earlier, which could be
+        # stale by the time checkout actually completes. An invalid/expired/
+        # deactivated code at this point is silently not applied (order
+        # still goes through at full price) rather than failing checkout --
+        # same "never let a downstream edge case break checkout" spirit as
+        # the unavailable-item handling above; core/commerce_flow.py already
+        # validates the code up front when the customer enters it, so this
+        # is only a rare last-moment race, not the primary validation path.
+        applied_coupon_code = None
+        discount_amount = None
+        if coupon_code:
+            coupon_row = conn.execute(
+                "SELECT * FROM coupons WHERE tenant_id = ? AND UPPER(code) = UPPER(?)",
+                (tenant_id, coupon_code),
+            ).fetchone()
+            coupon = _row_to_coupon(coupon_row) if coupon_row else None
+            if coupon_validity_error(coupon) is None:
+                applied_coupon_code = coupon.code
+                discount_amount = compute_discount(subtotal, coupon.discount_type, coupon.discount_value)
+
+        total = subtotal - discount_amount if discount_amount is not None else subtotal
         order_row = conn.execute(
-            "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total, language) "
-            "VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-            (tenant_id, customer_phone, ORDER_STATUS_PENDING_PAYMENT, subtotal, subtotal, language),
+            "INSERT INTO orders (tenant_id, customer_phone, status, subtotal, total, language, coupon_code, discount_amount) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            (tenant_id, customer_phone, ORDER_STATUS_PENDING_PAYMENT, subtotal, total, language,
+             applied_coupon_code, discount_amount),
         ).fetchone()
         order_id = order_row["id"]
 
@@ -898,3 +930,202 @@ def mark_nudge_sent(tenant_id: int, order_id: int) -> bool:
     )
     conn.commit()
     return cur.rowcount > 0
+
+
+# --- Customers (lightweight name-on-file, CareConnect's patient-name pattern) ---
+
+@dataclass
+class Customer:
+    tenant_id: int
+    phone: str
+    name: str
+    created_at: str
+    updated_at: str
+
+
+def _row_to_customer(row) -> Customer:
+    return Customer(
+        tenant_id=row["tenant_id"],
+        phone=row["phone"],
+        name=row["name"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def get_customer(tenant_id: int, phone: str) -> Customer | None:
+    """None means this phone number has never given a name at this tenant
+    -- core/commerce_flow.py's checkout step uses that to decide whether to
+    ask for one."""
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM customers WHERE tenant_id = ? AND phone = ?",
+        (tenant_id, phone),
+    ).fetchone()
+    return _row_to_customer(row) if row else None
+
+
+def set_customer_name(tenant_id: int, phone: str, name: str) -> Customer:
+    """Upsert -- a customer giving their name again (e.g. if they ever get
+    asked twice for some reason) just overwrites the previous value rather
+    than erroring on the (tenant_id, phone) primary key."""
+    conn = get_connection()
+    conn.execute(
+        "INSERT INTO customers (tenant_id, phone, name, updated_at) VALUES (?, ?, ?, now()::text) "
+        "ON CONFLICT (tenant_id, phone) DO UPDATE SET name = EXCLUDED.name, updated_at = EXCLUDED.updated_at",
+        (tenant_id, phone, name),
+    )
+    conn.commit()
+    return get_customer(tenant_id, phone)
+
+
+def get_customer_names(tenant_id: int, phones: list[str]) -> dict[str, str]:
+    """Bulk name lookup for the merchant portal's order list -- one query for
+    every phone on the page instead of one per row."""
+    if not phones:
+        return {}
+    conn = get_connection()
+    placeholders = ", ".join("?" for _ in phones)
+    rows = conn.execute(
+        f"SELECT phone, name FROM customers WHERE tenant_id = ? AND phone IN ({placeholders})",
+        (tenant_id, *phones),
+    ).fetchall()
+    return {r["phone"]: r["name"] for r in rows}
+
+
+# --- Coupons (SPEC.md "Offers" menu item) ---
+
+COUPON_TYPE_PERCENTAGE = "percentage"
+COUPON_TYPE_FLAT = "flat"
+
+
+@dataclass
+class Coupon:
+    id: int
+    tenant_id: int
+    code: str
+    discount_type: str  # COUPON_TYPE_PERCENTAGE or COUPON_TYPE_FLAT
+    discount_value: Decimal
+    is_active: bool
+    expires_at: str | None  # a date string ("YYYY-MM-DD"), valid through the end of that day -- see coupon_validity_error
+    created_at: str
+
+
+def _row_to_coupon(row) -> Coupon:
+    return Coupon(
+        id=row["id"],
+        tenant_id=row["tenant_id"],
+        code=row["code"],
+        discount_type=row["discount_type"],
+        discount_value=row["discount_value"],
+        is_active=bool(row["is_active"]),
+        expires_at=row["expires_at"],
+        created_at=row["created_at"],
+    )
+
+
+def create_coupon(
+    tenant_id: int,
+    code: str,
+    discount_type: str,
+    discount_value: Decimal,
+    expires_at: str | None = None,
+) -> Coupon:
+    """code is normalized to uppercase on save so "save10"/"SAVE10"/"Save10"
+    are always the same coupon -- get_coupon_by_code also compares
+    case-insensitively as a defensive second layer, but storing it
+    normalized keeps the portal's own coupon list unambiguous too.
+
+    Raises db.connection.IntegrityError if this tenant already has a coupon
+    with this code (schema.sql's UNIQUE(tenant_id, code)) -- portal/coupons.py
+    is responsible for catching it and showing a friendly "code already
+    exists" error, same pattern admin/onboarding.py uses for a duplicate
+    whatsapp_phone_number_id."""
+    conn = get_connection()
+    cur = conn.execute(
+        "INSERT INTO coupons (tenant_id, code, discount_type, discount_value, expires_at) "
+        "VALUES (?, ?, ?, ?, ?) RETURNING id",
+        (tenant_id, code.strip().upper(), discount_type, discount_value, expires_at),
+    )
+    new_id = cur.fetchone()["id"]
+    conn.commit()
+    return get_coupon(tenant_id, new_id)
+
+
+def get_coupon(tenant_id: int, coupon_id: int) -> Coupon | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM coupons WHERE tenant_id = ? AND id = ?",
+        (tenant_id, coupon_id),
+    ).fetchone()
+    return _row_to_coupon(row) if row else None
+
+
+def get_coupon_by_code(tenant_id: int, code: str) -> Coupon | None:
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT * FROM coupons WHERE tenant_id = ? AND UPPER(code) = UPPER(?)",
+        (tenant_id, code),
+    ).fetchone()
+    return _row_to_coupon(row) if row else None
+
+
+def list_coupons(tenant_id: int) -> list[Coupon]:
+    """The merchant portal's /portal/coupons page -- newest first."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT * FROM coupons WHERE tenant_id = ? ORDER BY created_at DESC",
+        (tenant_id,),
+    ).fetchall()
+    return [_row_to_coupon(r) for r in rows]
+
+
+def list_active_coupons(tenant_id: int) -> list[Coupon]:
+    """Active, unexpired coupons only -- what the bot's "Offers" menu item
+    shows a customer, as opposed to list_coupons' unfiltered merchant view."""
+    return [c for c in list_coupons(tenant_id) if coupon_validity_error(c) is None]
+
+
+def set_coupon_active(tenant_id: int, coupon_id: int, is_active: bool) -> None:
+    """The portal's deactivate/reactivate action -- coupons are never
+    deleted (orders.coupon_code stores the raw code text specifically so a
+    past order's record of its own discount survives regardless, see
+    schema.sql's column comment), only toggled off so they stop validating
+    for new checkouts."""
+    conn = get_connection()
+    conn.execute(
+        "UPDATE coupons SET is_active = ? WHERE tenant_id = ? AND id = ?",
+        (1 if is_active else 0, tenant_id, coupon_id),
+    )
+    conn.commit()
+
+
+def coupon_validity_error(coupon: Coupon | None) -> str | None:
+    """None if `coupon` can be applied right now; otherwise one of
+    "not_found"/"inactive"/"expired" -- core/commerce_flow.py maps each to a
+    clear customer-facing message via core/strings.py. Centralized here
+    (rather than duplicated between checkout_cart's last-moment recheck and
+    core/commerce_flow.py's up-front validation) so both places agree on
+    exactly what "valid" means."""
+    if coupon is None:
+        return "not_found"
+    if not coupon.is_active:
+        return "inactive"
+    if coupon.expires_at and coupon.expires_at < datetime.now().date().isoformat():
+        return "expired"
+    return None
+
+
+def compute_discount(subtotal: Decimal, discount_type: str, discount_value: Decimal) -> Decimal:
+    """Pure arithmetic, no DB access -- shared by checkout_cart's
+    authoritative discount calculation and core/commerce_flow.py's
+    cart-preview display, so the number a customer sees before confirming
+    always matches what checkout_cart actually charges. Flat discounts are
+    capped at the subtotal itself (never a negative total); percentage
+    discounts can't exceed 100% by construction (portal/coupons.py's create
+    form should reasonably cap this, but nothing here assumes it has)."""
+    if discount_type == COUPON_TYPE_PERCENTAGE:
+        raw = subtotal * discount_value / Decimal("100")
+    else:
+        raw = discount_value
+    return min(raw, subtotal).quantize(Decimal("0.01"))

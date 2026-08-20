@@ -412,3 +412,187 @@ def test_mark_nudge_sent_is_idempotent(tenant_id):
     assert first is True
     assert second is False  # already claimed -- no double nudge
     assert db.get_order(tenant_id, order.id).nudge_sent_at is not None
+
+
+# --- Customers (lightweight name-on-file) ---
+
+def test_get_customer_none_until_set(tenant_id):
+    assert db.get_customer(tenant_id, "919999999999") is None
+
+
+def test_set_customer_name_then_get(tenant_id):
+    db.set_customer_name(tenant_id, "919999999999", "Priya Sharma")
+
+    customer = db.get_customer(tenant_id, "919999999999")
+
+    assert customer is not None
+    assert customer.name == "Priya Sharma"
+
+
+def test_set_customer_name_upserts(tenant_id):
+    db.set_customer_name(tenant_id, "919999999999", "Priya")
+    db.set_customer_name(tenant_id, "919999999999", "Priya Sharma")
+
+    assert db.get_customer(tenant_id, "919999999999").name == "Priya Sharma"
+
+
+def test_customer_name_scoped_to_tenant(tenant_id, second_tenant_id):
+    db.set_customer_name(tenant_id, "919999999999", "Tenant A's Priya")
+
+    assert db.get_customer(second_tenant_id, "919999999999") is None
+
+
+def test_get_customer_names_bulk_lookup(tenant_id):
+    db.set_customer_name(tenant_id, "911111111111", "Amit")
+    db.set_customer_name(tenant_id, "922222222222", "Bina")
+
+    names = db.get_customer_names(tenant_id, ["911111111111", "922222222222", "933333333333"])
+
+    assert names == {"911111111111": "Amit", "922222222222": "Bina"}
+
+
+# --- Coupons ---
+
+def test_create_coupon_normalizes_code_uppercase(tenant_id):
+    coupon = db.create_coupon(tenant_id, "save10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    assert coupon.code == "SAVE10"
+
+
+def test_get_coupon_by_code_is_case_insensitive(tenant_id):
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    assert db.get_coupon_by_code(tenant_id, "save10") is not None
+    assert db.get_coupon_by_code(tenant_id, "Save10") is not None
+
+
+def test_get_coupon_by_code_not_found(tenant_id):
+    assert db.get_coupon_by_code(tenant_id, "NOPE") is None
+
+
+def test_coupon_scoped_to_tenant(tenant_id, second_tenant_id):
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    assert db.get_coupon_by_code(second_tenant_id, "SAVE10") is None
+
+
+def test_duplicate_code_same_tenant_raises_integrity_error(tenant_id):
+    from db.connection import IntegrityError
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    with pytest.raises(IntegrityError):
+        db.create_coupon(tenant_id, "save10", db.COUPON_TYPE_FLAT, Decimal("5"))
+
+
+def test_same_code_different_tenants_is_fine(tenant_id, second_tenant_id):
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    db.create_coupon(second_tenant_id, "SAVE10", db.COUPON_TYPE_FLAT, Decimal("5"))
+    assert db.get_coupon_by_code(tenant_id, "SAVE10").discount_type == db.COUPON_TYPE_PERCENTAGE
+    assert db.get_coupon_by_code(second_tenant_id, "SAVE10").discount_type == db.COUPON_TYPE_FLAT
+
+
+def test_coupon_validity_error_not_found():
+    assert db.coupon_validity_error(None) == "not_found"
+
+
+def test_coupon_validity_error_inactive(tenant_id):
+    coupon = db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    db.set_coupon_active(tenant_id, coupon.id, False)
+    assert db.coupon_validity_error(db.get_coupon_by_code(tenant_id, "SAVE10")) == "inactive"
+
+
+def test_coupon_validity_error_expired(tenant_id):
+    coupon = db.create_coupon(tenant_id, "OLD5", db.COUPON_TYPE_FLAT, Decimal("5"), expires_at="2000-01-01")
+    assert db.coupon_validity_error(coupon) == "expired"
+
+
+def test_coupon_validity_error_none_for_valid_coupon(tenant_id):
+    coupon = db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    assert db.coupon_validity_error(coupon) is None
+
+
+def test_coupon_not_expired_on_its_own_expiry_date(tenant_id):
+    """expires_at is valid *through* the end of that date, not up to its
+    start -- see coupon_validity_error's docstring."""
+    from datetime import date
+    coupon = db.create_coupon(tenant_id, "TODAY5", db.COUPON_TYPE_FLAT, Decimal("5"), expires_at=date.today().isoformat())
+    assert db.coupon_validity_error(coupon) is None
+
+
+def test_compute_discount_percentage():
+    assert db.compute_discount(Decimal("200.00"), db.COUPON_TYPE_PERCENTAGE, Decimal("10")) == Decimal("20.00")
+
+
+def test_compute_discount_flat():
+    assert db.compute_discount(Decimal("200.00"), db.COUPON_TYPE_FLAT, Decimal("50")) == Decimal("50.00")
+
+
+def test_compute_discount_flat_capped_at_subtotal():
+    assert db.compute_discount(Decimal("30.00"), db.COUPON_TYPE_FLAT, Decimal("50")) == Decimal("30.00")
+
+
+def test_list_active_coupons_excludes_inactive_and_expired(tenant_id):
+    active = db.create_coupon(tenant_id, "ACTIVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    inactive = db.create_coupon(tenant_id, "INACTIVE5", db.COUPON_TYPE_FLAT, Decimal("5"))
+    db.set_coupon_active(tenant_id, inactive.id, False)
+    db.create_coupon(tenant_id, "EXPIRED5", db.COUPON_TYPE_FLAT, Decimal("5"), expires_at="2000-01-01")
+
+    codes = {c.code for c in db.list_active_coupons(tenant_id)}
+
+    assert codes == {active.code}
+
+
+# --- checkout_cart with a coupon applied ---
+
+def test_checkout_cart_applies_percentage_coupon(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+
+    order, _ = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 2}, coupon_code="SAVE10")
+
+    assert order.subtotal == Decimal("200.00")
+    assert order.coupon_code == "SAVE10"
+    assert order.discount_amount == Decimal("20.00")
+    assert order.total == Decimal("180.00")
+
+
+def test_checkout_cart_applies_flat_coupon(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+    db.create_coupon(tenant_id, "FLAT30", db.COUPON_TYPE_FLAT, Decimal("30"))
+
+    order, _ = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 1}, coupon_code="FLAT30")
+
+    assert order.subtotal == Decimal("100.00")
+    assert order.discount_amount == Decimal("30.00")
+    assert order.total == Decimal("70.00")
+
+
+def test_checkout_cart_with_invalid_coupon_code_charges_full_price(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+
+    order, _ = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 1}, coupon_code="NOPE")
+
+    assert order.coupon_code is None
+    assert order.discount_amount is None
+    assert order.total == Decimal("100.00")
+
+
+def test_checkout_cart_with_inactive_coupon_code_charges_full_price(tenant_id):
+    product = db.create_product(tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+    coupon = db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+    db.set_coupon_active(tenant_id, coupon.id, False)
+
+    order, _ = db.checkout_cart(tenant_id, "919999999999", {str(product.id): 1}, coupon_code="SAVE10")
+
+    assert order.coupon_code is None
+    assert order.total == Decimal("100.00")
+
+
+def test_checkout_cart_coupon_from_other_tenant_is_ignored(tenant_id, second_tenant_id):
+    """A coupon created for tenant A must never apply to tenant B's order --
+    checkout_cart's coupon lookup is itself tenant-scoped (WHERE tenant_id =
+    ?), so tenant B's checkout simply doesn't find it, same as any other
+    unknown code."""
+    product = db.create_product(second_tenant_id, name="Widget", price=Decimal("100.00"), stock_quantity=5)
+    db.create_coupon(tenant_id, "SAVE10", db.COUPON_TYPE_PERCENTAGE, Decimal("10"))
+
+    order, _ = db.checkout_cart(second_tenant_id, "919999999999", {str(product.id): 1}, coupon_code="SAVE10")
+
+    assert order.coupon_code is None
+    assert order.total == Decimal("100.00")

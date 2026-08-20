@@ -80,6 +80,8 @@ STATE_SHOP_LIST = "SHOP_LIST"
 STATE_PRODUCT_DETAIL = "PRODUCT_DETAIL"
 STATE_POST_ADD = "POST_ADD"
 STATE_CART = "CART"
+STATE_APPLY_COUPON = "APPLY_COUPON"  # free-text coupon-code entry, entered from STATE_CART -- see _handle_apply_coupon
+STATE_COLLECT_NAME = "COLLECT_NAME"  # first-checkout-ever name prompt, entered from STATE_CART -- see _handle_collect_name
 STATE_ORDER_LIST = "ORDER_LIST"  # shared by "My Orders" and "Track Order" -- see _start_orders_list
 STATE_ORDER_DETAIL = "ORDER_DETAIL"
 
@@ -415,10 +417,18 @@ async def _send_add_to_cart_prompt(
     )
 
 
-async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict, lang: str) -> bool:
+async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict, lang: str, coupon_code: str | None = None) -> bool:
     """Returns False (sends an "empty cart" text instead) if the cart has no
     items -- can happen if every product in it was deactivated since being
-    added."""
+    added.
+
+    coupon_code: a coupon already applied earlier in this cart session
+    (context["coupon_code"], set by _handle_apply_coupon) -- shown here as a
+    discount line + adjusted total purely for preview. checkout_cart
+    recomputes the actual discount from scratch at confirm time (see its own
+    docstring), so a coupon that's expired/been deactivated since this
+    preview was shown simply won't display or apply -- fails open on
+    display, never charges based on a stale preview."""
     lines = []
     subtotal = Decimal("0")
     for product_id_str, qty in cart.items():
@@ -437,15 +447,42 @@ async def _send_cart(wa: WhatsAppClient, phone: str, tenant_id: int, cart: dict,
         f"{t('your_cart_header', lang)}\n\n" + "\n".join(lines)
         + f"\n\n{t('subtotal_label', lang, amount=_fmt_money(subtotal))}"
     )
+    if coupon_code:
+        coupon = db.get_coupon_by_code(tenant_id, coupon_code)
+        if coupon and db.coupon_validity_error(coupon) is None:
+            discount = db.compute_discount(subtotal, coupon.discount_type, coupon.discount_value)
+            body += f"\n{t('coupon_discount_label', lang, code=coupon.code, amount=_fmt_money(discount))}"
+            body += f"\n{t('order_total_label', lang, amount=_fmt_money(subtotal - discount))}"
     await wa.send_buttons(
         to=phone,
         body_text=body,
         buttons=[
             {"id": CHECKOUT, "title": t("checkout_button", lang)},
+            {"id": APPLY_COUPON, "title": t("apply_coupon_button", lang)},
             {"id": CONTINUE_SHOPPING, "title": t("continue_shopping_button", lang)},
         ],
     )
     return True
+
+
+async def _send_offers(wa: WhatsAppClient, phone: str, tenant_id: int, lang: str) -> None:
+    """The "Offers" main-menu item -- previously a bare "coming soon"
+    placeholder, now lists this tenant's active, unexpired coupons
+    (db.list_active_coupons) as plain text. Applying one happens later, at
+    checkout (_handle_apply_coupon) -- this is just discovery."""
+    coupons = db.list_active_coupons(tenant_id)
+    if not coupons:
+        await wa.send_text(phone, t("no_offers_available", lang))
+        return
+
+    lines = []
+    for c in coupons:
+        if c.discount_type == db.COUPON_TYPE_PERCENTAGE:
+            lines.append(t("offers_percentage_line", lang, code=c.code, value=c.discount_value))
+        else:
+            lines.append(t("offers_flat_line", lang, code=c.code, value=_fmt_money(c.discount_value)))
+
+    await wa.send_text(phone, t("offers_list_header", lang) + "\n\n" + "\n".join(lines))
 
 
 async def _send_orders_list(wa: WhatsAppClient, phone: str, tenant_id: int, customer_phone: str, lang: str) -> bool:
@@ -503,6 +540,7 @@ BACK_TO_PRODUCTS = "back_to_products"
 VIEW_CART = "view_cart"
 CONTINUE_SHOPPING = "continue_shopping"
 CHECKOUT = "checkout"
+APPLY_COUPON = "apply_coupon"
 MAIN_MENU_BTN = "main_menu"
 
 
@@ -569,7 +607,7 @@ async def _handle_idle(
             return
         if rid == MENU_OFFERS:
             sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
-            await wa.send_text(phone, t("offers_coming_soon", lang))
+            await _send_offers(wa, phone, tenant_id, lang)
             return
         if rid == MENU_ACCOUNT:
             sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
@@ -676,7 +714,7 @@ async def _handle_post_add(wa: WhatsAppClient, sessions, phone: str, tenant_id: 
         rid = reply["id"]
         if rid == VIEW_CART:
             sessions.set(tenant_id, phone, STATE_CART, context)
-            await _send_cart(wa, phone, tenant_id, context.get("cart", {}), lang)
+            await _send_cart(wa, phone, tenant_id, context.get("cart", {}), lang, context.get("coupon_code"))
             return
         if rid == CONTINUE_SHOPPING:
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
@@ -706,16 +744,90 @@ async def _handle_cart(wa: WhatsAppClient, sessions, phone: str, tenant_id: int,
             sessions.set(tenant_id, phone, STATE_SHOP_LIST, context)
             await _send_product_list(wa, phone, tenant_id, context.get("shop_offset", 0), lang)
             return
+        if rid == APPLY_COUPON:
+            sessions.set(tenant_id, phone, STATE_APPLY_COUPON, context)
+            await wa.send_text(phone, t("ask_coupon_code", lang))
+            return
         if rid == CHECKOUT:
-            await _checkout(wa, sessions, phone, tenant_id, cart, lang)
+            await _start_checkout(wa, sessions, phone, tenant_id, cart, lang, context.get("coupon_code"))
             return
 
     sessions.set(tenant_id, phone, STATE_CART, context)
     await wa.send_text(phone, t("please_choose", lang))
-    await _send_cart(wa, phone, tenant_id, cart, lang)
+    await _send_cart(wa, phone, tenant_id, cart, lang, context.get("coupon_code"))
 
 
-async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict, lang: str) -> None:
+async def _handle_apply_coupon(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    """Free-text coupon-code entry, reached by tapping "Apply Coupon" from
+    the cart (STATE_CART -> STATE_APPLY_COUPON). A valid code is stashed on
+    the session as context["coupon_code"] and the customer is dropped back
+    into the cart view, now showing the discount -- checkout_cart is what
+    actually re-validates and applies it at confirm time (see its own
+    docstring); this step is purely "tell the customer up front whether
+    their code works," not the source of truth."""
+    lang = context.get("language", DEFAULT_LANG)
+    cart = context.get("cart", {})
+    code = reply.get("text", "").strip() if reply["type"] == "text" else ""
+
+    if not code:
+        sessions.set(tenant_id, phone, STATE_APPLY_COUPON, context)
+        await wa.send_text(phone, t("ask_coupon_code", lang))
+        return
+
+    coupon = db.get_coupon_by_code(tenant_id, code)
+    error = db.coupon_validity_error(coupon)
+    if error:
+        sessions.set(tenant_id, phone, STATE_CART, context)
+        await wa.send_text(phone, t(f"coupon_error_{error}", lang, code=code))
+        await _send_cart(wa, phone, tenant_id, cart, lang, context.get("coupon_code"))
+        return
+
+    new_context = {**context, "coupon_code": coupon.code}
+    sessions.set(tenant_id, phone, STATE_CART, new_context)
+    await _send_cart(wa, phone, tenant_id, cart, lang, coupon.code)
+
+
+async def _handle_collect_name(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
+    """First-ever-checkout name prompt (STATE_CART's Checkout tap ->
+    STATE_COLLECT_NAME, see _start_checkout) -- CareConnect's
+    patient-name-collection pattern. Only reached when db.get_customer finds
+    nothing on file yet; a name given here is saved via db.set_customer_name
+    and every future checkout for this phone+tenant skips straight past this
+    step (_start_checkout's own db.get_customer check)."""
+    lang = context.get("language", DEFAULT_LANG)
+    cart = context.get("cart", {})
+    name = reply.get("text", "").strip() if reply["type"] == "text" else ""
+
+    if not name:
+        sessions.set(tenant_id, phone, STATE_COLLECT_NAME, context)
+        await wa.send_text(phone, t("ask_customer_name", lang))
+        return
+
+    db.set_customer_name(tenant_id, phone, name)
+    await _checkout(wa, sessions, phone, tenant_id, cart, lang, context.get("coupon_code"))
+
+
+async def _start_checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict, lang: str, coupon_code: str | None) -> None:
+    """Entry point for the Checkout tap (STATE_CART). Inserts a one-time name
+    prompt ahead of _checkout for a phone number this tenant has never seen
+    a name for yet -- skipped entirely (falls straight through to _checkout)
+    once db.get_customer finds one on file, same "bot remembers them"
+    principle as CareConnect. Skipped also for an empty cart -- _checkout's
+    own empty-cart message is more useful than asking for a name first."""
+    if not cart:
+        await _checkout(wa, sessions, phone, tenant_id, cart, lang, coupon_code)
+        return
+
+    customer = db.get_customer(tenant_id, phone)
+    if customer is not None:
+        await _checkout(wa, sessions, phone, tenant_id, cart, lang, coupon_code)
+        return
+
+    sessions.set(tenant_id, phone, STATE_COLLECT_NAME, {"language": lang, "cart": cart, "coupon_code": coupon_code})
+    await wa.send_text(phone, t("ask_customer_name", lang))
+
+
+async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, cart: dict, lang: str, coupon_code: str | None = None) -> None:
     """Creates a real orders row (ORDER_STATUS_PENDING_PAYMENT) + order_items
     from the cart, decrementing stock atomically, then generates a real
     Razorpay payment link (payments.py) for the order total and sends it as
@@ -741,14 +853,17 @@ async def _checkout(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, ca
         return
 
     sessions.set(tenant_id, phone, STATE_IDLE, {"language": lang})
-    await _complete_checkout_from_cart(wa, tenant_id, phone, cart, lang)
+    await _complete_checkout_from_cart(wa, tenant_id, phone, cart, lang, coupon_code)
 
 
-async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone: str, cart: dict, lang: str) -> None:
+async def _complete_checkout_from_cart(
+    wa: WhatsAppClient, tenant_id: int, phone: str, cart: dict, lang: str, coupon_code: str | None = None,
+) -> None:
     """The shared tail of both checkout paths: the tap-driven flow above
     (_checkout, after its own empty-cart guard + session reset) and
     handle_native_order below (Meta's native catalog cart, which has no
-    session to reset in the first place). Creates the order via
+    session to reset in the first place -- and no coupon-entry point either,
+    so it always passes coupon_code=None). Creates the order via
     db.checkout_cart, generates a Razorpay payment link, and sends the
     confirmation -- identical behavior regardless of which UI built the cart.
 
@@ -756,8 +871,10 @@ async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone
     param) so later payment-webhook confirmations can use it even after the
     conversation session itself has long since expired -- see
     handle_payment_success/handle_payment_failure below and schema.sql's
-    orders.language column comment."""
-    order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart, language=lang)
+    orders.language column comment. coupon_code is re-validated and its
+    discount recomputed inside db.checkout_cart itself, not trusted as-is --
+    see that function's docstring."""
+    order, unavailable_ids = db.checkout_cart(tenant_id, phone, cart, language=lang, coupon_code=coupon_code)
 
     if order is None:
         await wa.send_text(phone, t("cart_items_unavailable", lang))
@@ -769,10 +886,13 @@ async def _complete_checkout_from_cart(wa: WhatsAppClient, tenant_id: int, phone
         f"{_fmt_money(item.unit_price_at_order_time * item.quantity)}"
         for item in items
     )
-    message = (
-        f"{t('order_placed_confirmation', lang, id=order.id)}\n\n{lines}\n\n"
-        f"{t('order_total_label', lang, amount=_fmt_money(order.total))}"
-    )
+    message = f"{t('order_placed_confirmation', lang, id=order.id)}\n\n{lines}\n\n"
+    if order.coupon_code and order.discount_amount:
+        message += (
+            f"{t('subtotal_label', lang, amount=_fmt_money(order.subtotal))}\n"
+            f"{t('coupon_discount_label', lang, code=order.coupon_code, amount=_fmt_money(order.discount_amount))}\n"
+        )
+    message += t("order_total_label", lang, amount=_fmt_money(order.total))
 
     if unavailable_ids:
         dropped_names = [_product_name(tenant_id, int(pid)) for pid in unavailable_ids]
@@ -996,6 +1116,8 @@ _HANDLERS = {
     STATE_PRODUCT_DETAIL: _handle_product_detail,
     STATE_POST_ADD: _handle_post_add,
     STATE_CART: _handle_cart,
+    STATE_APPLY_COUPON: _handle_apply_coupon,
+    STATE_COLLECT_NAME: _handle_collect_name,
     STATE_ORDER_LIST: _handle_order_list,
     STATE_ORDER_DETAIL: _handle_order_detail,
 }

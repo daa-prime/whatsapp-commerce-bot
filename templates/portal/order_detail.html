@@ -6,12 +6,16 @@
 <h1>Order #{{ order.id }} <span class="status-badge {{ order.status }}">{{ order.status }}</span></h1>
 
 <div class="card">
+  <div class="review-row"><p class="label">Customer</p><p class="value">{{ customer_name or order.customer_phone }}</p></div>
   <div class="review-row"><p class="label">Customer phone</p><p class="value">{{ order.customer_phone }}</p></div>
   <div class="review-row"><p class="label">Placed</p><p class="value">{{ order.created_at }}</p></div>
   <div class="review-row"><p class="label">Paid at</p><p class="value">{{ order.paid_at or "not yet paid" }}</p></div>
   <div class="review-row"><p class="label">Payment method</p><p class="value">{{ order.payment_method or "--" }}</p></div>
   <div class="review-row"><p class="label">Payment link</p><p class="value">{% if order.payment_link_url %}<a href="{{ order.payment_link_url }}">{{ order.payment_link_url }}</a>{% else %}--{% endif %}</p></div>
   <div class="review-row"><p class="label">Subtotal</p><p class="value">{% if order.subtotal %}₹{{ "%.2f"|format(order.subtotal) }}{% else %}--{% endif %}</p></div>
+  {% if order.coupon_code %}
+  <div class="review-row"><p class="label">Coupon applied</p><p class="value">{{ order.coupon_code }} (-₹{{ "%.2f"|format(order.discount_amount) }})</p></div>
+  {% endif %}
   <div class="review-row"><p class="label">Total</p><p class="value">{% if order.total %}₹{{ "%.2f"|format(order.total) }}{% else %}--{% endif %}</p></div>
 </div>
 

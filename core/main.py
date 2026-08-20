@@ -19,6 +19,7 @@ from catalog.feed import PublicBaseURLNotConfigured, build_feed_csv
 from admin.onboarding import router as onboarding_router
 from admin.onboarding_wizard import router as onboarding_wizard_router
 from portal.auth import router as portal_auth_router
+from portal.coupons import router as portal_coupons_router
 from portal.dashboard import router as portal_dashboard_router
 from portal.orders import router as portal_orders_router
 from portal.products import router as portal_products_router
@@ -129,6 +130,7 @@ app.include_router(portal_auth_router)
 app.include_router(portal_dashboard_router)
 app.include_router(portal_orders_router)
 app.include_router(portal_products_router)
+app.include_router(portal_coupons_router)
 app.include_router(portal_settings_router)
 
 

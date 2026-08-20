@@ -18,7 +18,7 @@
       {% for o in orders %}
       <tr>
         <td><a href="/portal/orders/{{ o.id }}">#{{ o.id }}</a></td>
-        <td>{{ o.customer_phone }}</td>
+        <td>{{ customer_names.get(o.customer_phone, o.customer_phone) }}</td>
         <td>{% if o.total %}₹{{ "%.2f"|format(o.total) }}{% else %}--{% endif %}</td>
         <td><span class="status-badge {{ o.status }}">{{ o.status }}</span></td>
         <td>{{ o.created_at }}</td>
