@@ -941,6 +941,21 @@ async def handle_payment_failure(wa: WhatsAppClient, tenant: db.Tenant, order_id
     await wa.send_text(order.customer_phone, t("payment_link_expired_new", lang, id=order.id, url=new_url))
 
 
+async def handle_order_fulfilled(wa: WhatsAppClient, order: db.Order) -> None:
+    """Notifies the customer once the merchant marks their (already-paid)
+    order fulfilled via the portal (portal/orders.py's POST
+    /portal/orders/{id}/fulfill). Called only when db.mark_order_fulfilled()
+    itself reports it made the transition -- same idempotency contract as
+    handle_payment_success/handle_payment_failure, so a merchant re-clicking
+    an already-fulfilled order's button never re-sends this.
+
+    No session/state-machine involvement, same reasoning as the payment
+    webhook handlers above: this fires from a portal HTTP request, not a
+    customer's live conversation turn, so language comes from
+    order.language (snapshotted at checkout), never a session lookup."""
+    await wa.send_text(order.customer_phone, t("order_fulfilled", order.language, id=order.id))
+
+
 async def _handle_order_list(wa: WhatsAppClient, sessions, phone: str, tenant_id: int, reply: dict, context: dict) -> None:
     lang = context.get("language", DEFAULT_LANG)
     if reply["type"] == "interactive_reply":

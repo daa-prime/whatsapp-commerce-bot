@@ -4,6 +4,7 @@ Merchant portal order management (portal/orders.py): list all orders
 (optionally filtered by status), view one order's detail, and mark a paid
 order fulfilled.
 """
+import json
 import os
 from decimal import Decimal
 
@@ -91,6 +92,73 @@ def test_fulfill_no_ops_from_pending_payment(tenant_id):
 
     updated = db.get_order(tenant_id, order.id)
     assert updated.status == db.ORDER_STATUS_PENDING_PAYMENT  # unchanged, not fulfilled
+
+
+def test_fulfill_sends_whatsapp_notification(tenant_id, httpx_mock):
+    """Marking a paid order fulfilled must notify the customer -- same
+    "notify on the transition that actually happened" pattern
+    handle_payment_success/handle_payment_failure already use for the
+    Razorpay webhook path (tests/test_payment_webhook.py)."""
+    order = db.create_order(tenant_id, "9998887777", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "wamid.x"}]})
+
+    client = _login(tenant_id)
+    resp = client.post(f"/portal/orders/{order.id}/fulfill")
+    assert resp.status_code == 200
+
+    requests = httpx_mock.get_requests()
+    assert len(requests) == 1
+    sent_body = json.loads(requests[0].content)
+    assert sent_body["to"] == "9998887777"
+    assert f"#{order.id}" in sent_body["text"]["body"]
+    assert "fulfilled" in sent_body["text"]["body"].lower()
+
+
+def test_fulfill_notification_uses_correct_tenant_whatsapp_credentials(httpx_mock):
+    """The notification must go out through the fulfilling tenant's own
+    WhatsApp phone number/access token, not whichever tenant happens to be
+    seeded first -- same cross-tenant-credentials concern
+    tests/test_payment_webhook.py's own tenant-scoping tests cover for the
+    payment-confirmation path."""
+    tenant = db.create_tenant("Tenant B", whatsapp_phone_number_id="999888777", access_token="tenant-b-secret-token")
+    order = db.create_order(tenant.id, "9998887777", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/999888777/messages", json={"messages": [{"id": "wamid.x"}]})
+
+    client = _login(tenant.id, phone_number_id="999888777")
+    resp = client.post(f"/portal/orders/{order.id}/fulfill")
+    assert resp.status_code == 200
+
+    requests = httpx_mock.get_requests()
+    assert len(requests) == 1
+    assert requests[0].url == "https://graph.facebook.com/v22.0/999888777/messages"
+    assert requests[0].headers["Authorization"] == "Bearer tenant-b-secret-token"
+
+
+def test_fulfill_no_op_from_pending_payment_sends_no_notification(tenant_id, httpx_mock):
+    """A fulfill click against a not-yet-paid order is a no-op
+    (db.mark_order_fulfilled's `WHERE status = 'paid'` guard) -- since
+    nothing actually transitioned, no WhatsApp message should go out
+    either. Covers the "doesn't fire on unrelated status changes" case."""
+    order = db.create_order(tenant_id, "111", status=db.ORDER_STATUS_PENDING_PAYMENT, subtotal=Decimal("50"), total=Decimal("50"))
+
+    client = _login(tenant_id)
+    client.post(f"/portal/orders/{order.id}/fulfill")
+
+    assert httpx_mock.get_requests() == []
+
+
+def test_fulfill_already_fulfilled_does_not_resend_notification(tenant_id, httpx_mock):
+    """A second fulfill click against an already-fulfilled order is also a
+    no-op transition -- guards against a merchant double-clicking (or
+    reloading the redirect) re-notifying the customer."""
+    order = db.create_order(tenant_id, "111", status=db.ORDER_STATUS_PAID, subtotal=Decimal("50"), total=Decimal("50"))
+    httpx_mock.add_response(url="https://graph.facebook.com/v22.0/123/messages", json={"messages": [{"id": "wamid.x"}]})
+
+    client = _login(tenant_id)
+    client.post(f"/portal/orders/{order.id}/fulfill")
+    client.post(f"/portal/orders/{order.id}/fulfill")
+
+    assert len(httpx_mock.get_requests()) == 1  # only the first click actually transitioned the order
 
 
 def test_cross_tenant_isolation(tenant_id, second_tenant_id):

@@ -252,6 +252,10 @@ _STRINGS: dict[str, dict[str, str]] = {
         LANG_EN: "You still have an order waiting — order #{id}. Send us a message to complete your checkout.",
         LANG_HI: "आपका एक ऑर्डर अभी भी लंबित है — ऑर्डर #{id}। अपना चेकआउट पूरा करने के लिए हमें संदेश भेजें।",
     },
+    "order_fulfilled": {
+        LANG_EN: "Good news! Your order #{id} has been fulfilled and is on its way.",
+        LANG_HI: "अच्छी खबर! आपका ऑर्डर #{id} पूरा हो गया है और जल्द ही आप तक पहुंच जाएगा।",
+    },
 }
 
 _STATUS_LABELS: dict[str, dict[str, str]] = {

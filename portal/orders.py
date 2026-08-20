@@ -16,6 +16,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 
 import db.repository as db
+from core.commerce_flow import handle_order_fulfilled
+from core.whatsapp import WhatsAppClient
 from portal.session import require_session
 
 router = APIRouter()
@@ -90,5 +92,13 @@ async def order_fulfill(request: Request, order_id: int):
     if order is None:
         return HTMLResponse("<p>Order not found.</p>", status_code=404)
 
-    db.mark_order_fulfilled(tenant.id, order_id)
+    transitioned = db.mark_order_fulfilled(tenant.id, order_id)
+    if transitioned:
+        # Built per-request rather than cached (unlike core/main.py's
+        # _wa_clients) -- fulfillment is a low-frequency merchant click, not
+        # the per-message hot path that cache exists for, and caching here
+        # would mean either duplicating that cache or importing core.main
+        # into portal/orders.py, which core.main already imports (circular).
+        wa = WhatsAppClient(phone_number_id=tenant.whatsapp_phone_number_id, access_token=tenant.access_token)
+        await handle_order_fulfilled(wa, order)
     return RedirectResponse(url=f"/portal/orders/{order_id}", status_code=303)
